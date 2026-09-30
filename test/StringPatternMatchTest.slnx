@@ -1,0 +1,8 @@
+<Solution>
+  <Configurations>
+    <Platform Name="ARM64" />
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="StringPatternMatchTest.vcxproj" Id="24dfdf92-d16f-49a2-b719-24cc459435b9" />
+</Solution>

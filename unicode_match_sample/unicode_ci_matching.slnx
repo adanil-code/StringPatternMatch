@@ -1,0 +1,8 @@
+<Solution>
+  <Configurations>
+    <Platform Name="ARM64" />
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="unicode_ci_matching.vcxproj" Id="df162171-d599-4f6b-a801-9ab7a0d5398c" />
+</Solution>

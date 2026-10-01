@@ -28,6 +28,7 @@
 #include <cwchar>
 #include <concepts>
 #include <stdexcept>
+#include <atomic>
 
 // Platform-specific SIMD headers
 #if defined(_M_X64) || defined(__x86_64__)
@@ -82,6 +83,17 @@
 // non-matching targets in O(1) time. The engine performs a SWAR/exact string comparison of 
 // the prefix. If the prefix matches, the remaining suffix is evaluated against an iterative,
 // non-recursive wildcard backtracking engine augmented with remaining-length bounds checking.
+//
+// Thread Safety & Concurrency Architecture:
+// This engine is intentionally NOT thread-safe for concurrent mutation and querying to preserve
+// peak SIMD cache performance. Do NOT use std::mutex to protect Search() and AddPattern(), 
+// as this will serialize the read path and cause massive CPU cache-line invalidation.
+//
+// Instead, utilize the Read-Copy-Update (RCU) / Atomic Swap pattern:
+// 1. Construct a new StringPatternMatch instance offline in a background thread.
+// 2. Populate the new instance with the updated pattern rules.
+// 3. Atomically swap the active engine pointer (e.g., using std::atomic<std::shared_ptr<T>>).
+// 4. Readers atomically load the pointer and execute Search() completely lock-free.
 //-------------------------------------------------------------------------------------------
 
 //-------------------------------------------------------------------------------------------
@@ -492,9 +504,15 @@ namespace StringPatternMatchDetail
                 return SimdInstructionSet::Sse41;
             }
             return SimdInstructionSet::Scalar;
-#elif defined(_M_ARM64) || defined(__aarch64__) || defined(_M_ARM) || defined(__arm__)
-            // ARM architectures natively mandate 128-bit NEON execution units
+#elif defined(_M_ARM64) || defined(__aarch64__)
+            // ARM64 architectures natively mandate 128-bit NEON execution units
             return SimdInstructionSet::Neon;
+#elif defined(_M_ARM) || defined(__arm__)
+#if defined(__ARM_NEON)
+            return SimdInstructionSet::Neon;
+#else
+            return SimdInstructionSet::Scalar;
+#endif
 #else
             return SimdInstructionSet::Scalar;
 #endif
@@ -524,9 +542,13 @@ namespace StringPatternMatchDetail
         {
             return (w & 0x8080808080808080ULL) == 0;
         }
-        else
+        else if constexpr (sizeof(TChar) == 2)
         {
             return (w & 0xFF80FF80FF80FF80ULL) == 0;
+        }
+        else
+        {
+            return (w & 0xFFFFFF80FFFFFF80ULL) == 0;
         }
     }
 
@@ -547,18 +569,26 @@ namespace StringPatternMatchDetail
         if constexpr (sizeof(TChar) == 1)
         {
             uint64_t NotUnderA = w + 0x1F1F1F1F1F1F1F1FULL;
-            uint64_t NotOverZ = 0xFAFAFAFAFAFAFAFAULL - w;
-            uint64_t IsLower = NotUnderA & NotOverZ & 0x8080808080808080ULL;
+            uint64_t NotOverZ  = 0xFAFAFAFAFAFAFAFAULL - w;
+            uint64_t IsLower   = NotUnderA & NotOverZ & 0x8080808080808080ULL;
 
             return w - ((IsLower >> 2) & 0x2020202020202020ULL);
         }
-        else
+        else if constexpr (sizeof(TChar) == 2)
         {
             uint64_t NotUnderA = w + 0x7F9F7F9F7F9F7F9FULL;
-            uint64_t NotOverZ = 0x807A807A807A807AULL - w;
-            uint64_t IsLower = NotUnderA & NotOverZ & 0x8000800080008000ULL;
+            uint64_t NotOverZ  = 0x807A807A807A807AULL - w;
+            uint64_t IsLower   = NotUnderA & NotOverZ & 0x8000800080008000ULL;
 
             return w - ((IsLower >> 10) & 0x0020002000200020ULL);
+        }
+        else
+        {
+            uint64_t NotUnderA = w + 0x7FFFFF9F7FFFFF9FULL;
+            uint64_t NotOverZ  = 0x8000007A8000007AULL - w;
+            uint64_t IsLower   = NotUnderA & NotOverZ & 0x8000000080000000ULL;
+
+            return w - ((IsLower >> 26) & 0x0000002000000020ULL);
         }
     }
 
@@ -925,8 +955,8 @@ namespace StringPatternMatchDetail
             const __m128i w128 = _mm_setr_epi32(131 * 131 * 131, 131 * 131, 131, 1);
             const __m256i w256 = _mm256_set_m128i(w128, w128);
 
-            __m256i mul1  = _mm256_mul_epu32(chars32, w256);
-            __m256i mul2  = _mm256_mul_epu32(_mm256_srli_si256(chars32, 4), _mm256_srli_si256(w256, 4));
+            __m256i mul1 = _mm256_mul_epu32(chars32, w256);
+            __m256i mul2 = _mm256_mul_epu32(_mm256_srli_si256(chars32, 4), _mm256_srli_si256(w256, 4));
             __m256i sum64 = _mm256_add_epi64(mul1, mul2);
             __m256i total = _mm256_add_epi64(sum64, _mm256_unpackhi_epi64(sum64, sum64));
 
@@ -965,6 +995,18 @@ namespace StringPatternMatchDetail
 
                 for (; i + VecStep - 1 < compareLength; i += VecStep)
                 {
+                    if constexpr (!std::same_as<TPolicy, AsciiCaseFoldPolicy<char>> && TPolicy::isCaseInsensitive)
+                    {
+                        for (uint32_t k = 0; k < VecStep; ++k)
+                        {
+                            if (upperText1[i + k] != policy(text2[i + k]))
+                            {
+                                return false;
+                            }
+                        }
+                        continue;
+                    }
+
                     __m256i c1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(upperText1 + i));
                     __m256i raw = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(text2 + i));
 
@@ -982,6 +1024,7 @@ namespace StringPatternMatchDetail
             }
             else
             {
+#if WCHAR_MAX <= 0xFFFF
                 constexpr uint32_t VecStep = 16;
 
                 const __m256i aMin         = _mm256_set1_epi16('a' - 1);
@@ -1021,6 +1064,47 @@ namespace StringPatternMatchDetail
                         return false;
                     }
                 }
+#else
+                constexpr uint32_t VecStep = 8;
+
+                const __m256i aMin         = _mm256_set1_epi32('a' - 1);
+                const __m256i zMax         = _mm256_set1_epi32('z' + 1);
+                const __m256i foldSub      = _mm256_set1_epi32(32);
+                const __m256i nonAsciiMask = _mm256_set1_epi32(~127);
+
+                for (; i + VecStep - 1 < compareLength; i += VecStep)
+                {
+                    __m256i raw = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(text2 + i));
+
+                    if constexpr (!std::same_as<TPolicy, AsciiCaseFoldPolicy<wchar_t>> && TPolicy::isCaseInsensitive)
+                    {
+                        if (!_mm256_testz_si256(raw, nonAsciiMask))
+                        {
+                            for (uint32_t k = 0; k < VecStep; ++k)
+                            {
+                                if (upperText1[i + k] != policy(text2[i + k]))
+                                {
+                                    return false;
+                                }
+                            }
+
+                            continue;
+                        }
+                    }
+                    __m256i c1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(upperText1 + i));
+
+                    if constexpr (TPolicy::isCaseInsensitive)
+                    {
+                        __m256i isLower = _mm256_and_si256(_mm256_cmpgt_epi32(raw, aMin), _mm256_cmpgt_epi32(zMax, raw));
+                        raw = _mm256_sub_epi32(raw, _mm256_and_si256(isLower, foldSub));
+                    }
+
+                    if (static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi32(c1, raw))) != 0xFFFFFFFF)
+                    {
+                        return false;
+                    }
+                }
+#endif
             }
 
             for (; i < compareLength; i++)
@@ -1093,6 +1177,7 @@ namespace StringPatternMatchDetail
             uint64_t b1 = static_cast<uint64_t>(_mm_cvtsi128_si64(_mm256_extracti128_si256(low256, 1)));
             uint64_t b2 = static_cast<uint64_t>(_mm_cvtsi128_si64(_mm256_castsi256_si128(high256)));
             uint64_t b3 = static_cast<uint64_t>(_mm_cvtsi128_si64(_mm256_extracti128_si256(high256, 1)));
+            
             return (b0 * M8 * M4) + (b1 * M8) + (b2 * M4) + b3;
         }
 
@@ -1124,6 +1209,19 @@ namespace StringPatternMatchDetail
 
                 for (; i + VecStep - 1 < compareLength; i += VecStep)
                 {
+                    if constexpr (!std::same_as<TPolicy, AsciiCaseFoldPolicy<char>> && TPolicy::isCaseInsensitive)
+                    {
+                        for (uint32_t k = 0; k < VecStep; ++k)
+                        {
+                            if (upperText1[i + k] != policy(text2[i + k]))
+                            {
+                                return false;
+                            }
+                        }
+
+                        continue;
+                    }
+
                     __m512i c1 = _mm512_loadu_si512(reinterpret_cast<const void*>(upperText1 + i));
                     __m512i raw = _mm512_loadu_si512(reinterpret_cast<const void*>(text2 + i));
 
@@ -1132,6 +1230,7 @@ namespace StringPatternMatchDetail
                         __mmask64 isLower = _mm512_cmpgt_epi8_mask(raw, aMin) & _mm512_cmplt_epi8_mask(raw, zMax);
                         raw = _mm512_mask_sub_epi8(raw, isLower, raw, foldSub);
                     }
+
                     if (_mm512_cmpneq_epi8_mask(c1, raw) != 0)
                     {
                         return false;
@@ -1158,8 +1257,12 @@ namespace StringPatternMatchDetail
                         {
                             for (uint32_t k = 0; k < VecStep; ++k)
                             {
-                                if (upperText1[i + k] != policy(text2[i + k])) return false;
+                                if (upperText1[i + k] != policy(text2[i + k]))
+                                {
+                                    return false;
+                                }
                             }
+
                             continue;
                         }
                     }
@@ -1193,7 +1296,10 @@ namespace StringPatternMatchDetail
                         {
                             for (uint32_t k = 0; k < VecStep; ++k)
                             {
-                                if (upperText1[i + k] != policy(text2[i + k])) return false;
+                                if (upperText1[i + k] != policy(text2[i + k]))
+                                {
+                                    return false;
+                                }
                             }
                             continue;
                         }
@@ -1232,9 +1338,106 @@ namespace StringPatternMatchDetail
     struct TraitsNeon
     {
         using VecT = uint32x4_t;
-        static constexpr uint32_t Step = 4; // Number of code units evaluated per 128-bit vector iteration during polynomial hashing.
-                                            // Prefix comparisons utilize wider byte-level strides.
+        static constexpr uint32_t Step = 4;
 
+    private:
+        // -------------------------------------------------------------------------------------------
+        // AArch64 / ARMv7 Compatibility Shims
+        // Abstracts hardware-specific horizontal vector reductions to eliminate inline preprocessor branching
+        // and prevent MSVC C++ type overload resolution failures on mapped typedefs.
+        // -------------------------------------------------------------------------------------------
+#if defined(__aarch64__)
+        static inline uint16_t ReduceMax16(uint16x8_t v)
+        {
+            return vmaxvq_u16(v);
+        }
+
+        static inline uint32_t ReduceMax32(uint32x4_t v)
+        {
+            return vmaxvq_u32(v);
+        }
+
+        static inline uint8_t ReduceMin8(uint8x16_t v)
+        {
+            return vminvq_u8(v);
+        }
+
+        static inline uint16_t ReduceMin16(uint16x8_t v)
+        {
+            return vminvq_u16(v);
+        }
+
+        static inline uint32_t ReduceMin32(uint32x4_t v)
+        {
+            return vminvq_u32(v);
+        }
+
+        static inline uint64_t ReduceAdd64(uint64x2_t v)
+        {
+            return vaddvq_u64(v);
+        }
+
+        static inline uint64x2_t MultiplyHigh32(uint32x4_t a, uint32x4_t b)
+        {
+            return vmull_high_u32(a, b);
+        }
+#else
+        static inline uint16_t ReduceMax16(uint16x8_t v)
+        {
+            uint16x4_t maxHalves = vmax_u16(vget_low_u16(v), vget_high_u16(v));
+            uint16x4_t maxAll    = vpmax_u16(maxHalves, maxHalves);
+            maxAll               = vpmax_u16(maxAll, maxAll);
+            
+            return vget_lane_u16(maxAll, 0);
+        }
+
+        static inline uint32_t ReduceMax32(uint32x4_t v)
+        {
+            uint32x2_t maxHalves = vmax_u32(vget_low_u32(v), vget_high_u32(v));
+            uint32x2_t maxAll    = vpmax_u32(maxHalves, maxHalves);
+            
+            return vget_lane_u32(maxAll, 0);
+        }
+
+        static inline uint8_t ReduceMin8(uint8x16_t v)
+        {
+            uint8x8_t minHalves = vmin_u8(vget_low_u8(v), vget_high_u8(v));
+            uint8x8_t minAll    = vpmin_u8(minHalves, minHalves);
+            minAll              = vpmin_u8(minAll, minAll);
+            minAll              = vpmin_u8(minAll, minAll);
+            
+            return vget_lane_u8(minAll, 0);
+        }
+
+        static inline uint16_t ReduceMin16(uint16x8_t v)
+        {
+            uint16x4_t minHalves = vmin_u16(vget_low_u16(v), vget_high_u16(v));
+            uint16x4_t minAll    = vpmin_u16(minHalves, minHalves);
+            minAll               = vpmin_u16(minAll, minAll);
+            
+            return vget_lane_u16(minAll, 0);
+        }
+
+        static inline uint32_t ReduceMin32(uint32x4_t v)
+        {
+            uint32x2_t minHalves = vmin_u32(vget_low_u32(v), vget_high_u32(v));
+            uint32x2_t minAll    = vpmin_u32(minHalves, minHalves);
+            
+            return vget_lane_u32(minAll, 0);
+        }
+
+        static inline uint64_t ReduceAdd64(uint64x2_t v)
+        {
+            return vgetq_lane_u64(v, 0) + vgetq_lane_u64(v, 1);
+        }
+
+        static inline uint64x2_t MultiplyHigh32(uint32x4_t a, uint32x4_t b)
+        {
+            return vmull_u32(vget_high_u32(a), vget_high_u32(b));
+        }
+#endif
+
+    public:
         template <SupportedChar CharT>
         static inline VecT Load(const CharT* ptr)
         {
@@ -1242,17 +1445,23 @@ namespace StringPatternMatchDetail
             {
                 uint32_t val;
                 std::memcpy(&val, ptr, sizeof(val));
-                return vmovl_u16(vget_low_u16(vmovl_u8(vreinterpret_u8_u32(vset_lane_u32(val, vdup_n_u32(0), 0)))));
+                
+                // Load 4 bytes directly into lane 0 and widen without multi-stage unpacking
+                uint8x8_t v8 = vreinterpret_u8_u32(vset_lane_u32(val, vdup_n_u32(0), 0));
+                
+                return vmovl_u16(vget_low_u16(vmovl_u8(v8)));
             }
             else
             {
 #if WCHAR_MAX <= 0xFFFF
                 uint64_t val;
                 std::memcpy(&val, ptr, sizeof(val));
+                
                 return vmovl_u16(vcreate_u16(val));
 #else
                 uint32x4_t val;
                 std::memcpy(&val, ptr, sizeof(val));
+                
                 return val;
 #endif
             }
@@ -1260,40 +1469,34 @@ namespace StringPatternMatchDetail
 
         static inline bool HasNonAscii(VecT v)
         {
-#if defined(__aarch64__)
-            return vmaxvq_u32(v) > 127;
-#else
-            uint32x2_t maxHalves = vmax_u32(vget_low_u32(v), vget_high_u32(v));
-            uint32x2_t maxAll    = vpmax_u32(maxHalves, maxHalves);
-            return vget_lane_u32(maxAll, 0) > 127;
-#endif
+            return ReduceMax32(v) > 127;
         }
 
         static inline VecT CaseFold(VecT v)
         {
-            uint32x4_t isLower = vandq_u32(vcgtq_u32(v, vdupq_n_u32('a' - 1)), vcgtq_u32(vdupq_n_u32('z' + 1), v));
+            // Branchless range folding using unsigned delta: (v - 'a') < 26
+            uint32x4_t delta   = vsubq_u32(v, vdupq_n_u32('a'));
+            uint32x4_t isLower = vcgtq_u32(vdupq_n_u32(26), delta);
+            
             return vsubq_u32(v, vandq_u32(isLower, vdupq_n_u32(32)));
         }
 
-        static inline bool CmpEq(VecT a,
-                                 VecT b)
+        static inline bool CmpEq(VecT a, VecT b)
         {
-            return vminvq_u32(vceqq_u32(a, b)) == 0xFFFFFFFF;
+            return ReduceMin32(vceqq_u32(a, b)) == 0xFFFFFFFF;
         }
 
         static inline uint64_t HashBlock(VecT chars32)
         {
-            const uint32_t weightsArr[4] = {131 * 131 * 131, 131 * 131, 131, 1};
-
-            uint32x4_t weights = vld1q_u32(weightsArr);
-            uint64x2_t mulLow  = vmull_u32(vget_low_u32(chars32), vget_low_u32(weights));
-            uint64x2_t mulHigh = vmull_u32(vget_high_u32(chars32), vget_high_u32(weights));
-            uint64x2_t sum64   = vaddq_u64(mulLow, mulHigh);
-#if defined(__aarch64__)
-            return vaddvq_u64(sum64);
-#else
-            return vgetq_lane_u64(sum64, 0) + vgetq_lane_u64(sum64, 1);
-#endif
+            // Vectorized weights static constant
+            alignas(16) static constexpr uint32_t kWeights[4] = {131 * 131 * 131, 131 * 131, 131, 1};
+            
+            const uint32x4_t weights = vld1q_u32(kWeights);
+            uint64x2_t       mulLow  = vmull_u32(vget_low_u32(chars32), vget_low_u32(weights));
+            uint64x2_t       mulHigh = MultiplyHigh32(chars32, weights);
+            uint64x2_t       sum64   = vaddq_u64(mulLow, mulHigh);
+            
+            return ReduceAdd64(sum64);
         }
 
         SPM_GENERATE_PROCESS_CASING(SPM_TARGET_NEON)
@@ -1307,13 +1510,130 @@ namespace StringPatternMatchDetail
             SPM_GENERATE_CALCULATE_HASH(TraitsNeon)
         }
 
+        // Full 128-bit vectorization for prefix comparison (16 bytes/iteration)
         template <SupportedChar CharT, typename TPolicy>
         static bool ComparePrefix(const CharT* upperText1,
                                   const CharT* text2,
                                   uint32_t     compareLength,
                                   TPolicy      policy) noexcept
         {
-            SPM_GENERATE_COMPARE_PREFIX(TraitsNeon)
+            uint32_t i = 0;
+            
+            if constexpr (std::is_same_v<CharT, char>)
+            {
+                constexpr uint32_t VecStep = 16;
+                const uint8x16_t   aMin    = vdupq_n_u8('a');
+                const uint8x16_t   aMax    = vdupq_n_u8('z');
+                const uint8x16_t   sub32   = vdupq_n_u8(32);
+
+                for (; i + VecStep - 1 < compareLength; i += VecStep)
+                {
+                    uint8x16_t c1  = vld1q_u8(reinterpret_cast<const uint8_t*>(upperText1 + i));
+                    uint8x16_t raw = vld1q_u8(reinterpret_cast<const uint8_t*>(text2 + i));
+
+                    if constexpr (TPolicy::isCaseInsensitive)
+                    {
+                        uint8x16_t isLower = vandq_u8(vcgeq_u8(raw, aMin), vcleq_u8(raw, aMax));
+                        raw                = vsubq_u8(raw, vandq_u8(isLower, sub32));
+                    }
+
+                    if (ReduceMin8(vceqq_u8(c1, raw)) != 0xFF)
+                    {
+                        return false;
+                    }
+                }
+            }
+            else
+            {
+#if WCHAR_MAX <= 0xFFFF
+                constexpr uint32_t VecStep = 8;
+                const uint16x8_t   aMin    = vdupq_n_u16('a');
+                const uint16x8_t   aMax    = vdupq_n_u16('z');
+                const uint16x8_t   sub32   = vdupq_n_u16(32);
+
+                for (; i + VecStep - 1 < compareLength; i += VecStep)
+                {
+                    uint16x8_t raw = vld1q_u16(reinterpret_cast<const uint16_t*>(text2 + i));
+
+                    if constexpr (!std::same_as<TPolicy, AsciiCaseFoldPolicy<wchar_t>> && TPolicy::isCaseInsensitive)
+                    {
+                        if (ReduceMax16(raw) > 127)
+                        {
+                            for (uint32_t k = 0; k < VecStep; ++k)
+                            {
+                                if (upperText1[i + k] != policy(text2[i + k]))
+                                {
+                                    return false;
+                                }
+                            }
+                            continue;
+                        }
+                    }
+
+                    uint16x8_t c1 = vld1q_u16(reinterpret_cast<const uint16_t*>(upperText1 + i));
+
+                    if constexpr (TPolicy::isCaseInsensitive)
+                    {
+                        uint16x8_t isLower = vandq_u16(vcgeq_u16(raw, aMin), vcleq_u16(raw, aMax));
+                        raw                = vsubq_u16(raw, vandq_u16(isLower, sub32));
+                    }
+
+                    if (ReduceMin16(vceqq_u16(c1, raw)) != 0xFFFF)
+                    {
+                        return false;
+                    }
+                }
+#else
+                constexpr uint32_t VecStep = 4;
+                const uint32x4_t   aMin    = vdupq_n_u32('a');
+                const uint32x4_t   aMax    = vdupq_n_u32('z');
+                const uint32x4_t   sub32   = vdupq_n_u32(32);
+
+                for (; i + VecStep - 1 < compareLength; i += VecStep)
+                {
+                    uint32x4_t raw = vld1q_u32(reinterpret_cast<const uint32_t*>(text2 + i));
+
+                    if constexpr (!std::same_as<TPolicy, AsciiCaseFoldPolicy<wchar_t>> && TPolicy::isCaseInsensitive)
+                    {
+                        if (ReduceMax32(raw) > 127)
+                        {
+                            for (uint32_t k = 0; k < VecStep; ++k)
+                            {
+                                if (upperText1[i + k] != policy(text2[i + k]))
+                                {
+                                    return false;
+                                }
+                            }
+                            continue;
+                        }
+                    }
+
+                    uint32x4_t c1 = vld1q_u32(reinterpret_cast<const uint32_t*>(upperText1 + i));
+
+                    if constexpr (TPolicy::isCaseInsensitive)
+                    {
+                        uint32x4_t isLower = vandq_u32(vcgeq_u32(raw, aMin), vcleq_u32(raw, aMax));
+                        raw                = vsubq_u32(raw, vandq_u32(isLower, sub32));
+                    }
+
+                    if (ReduceMin32(vceqq_u32(c1, raw)) != 0xFFFFFFFF)
+                    {
+                        return false;
+                    }
+                }
+#endif
+            }
+
+            // Remainder scalar loop
+            for (; i < compareLength; i++)
+            {
+                if (upperText1[i] != policy(text2[i]))
+                {
+                    return false;
+                }
+            }
+            
+            return true;
         }
     };
 
@@ -1483,7 +1803,7 @@ namespace StringPatternMatchDetail
 
     protected:
         // Cache-aligned, bounds-eliminated struct linking separated pattern components to their context
-        struct PatternEntry
+        struct alignas(64) PatternEntry
         {
             uint64_t      prefixSignature;        // 64-bit SWAR/packed signature of prefix start for O(1) early rejection
             const CharT*  prefixData;             // Pointer to start of literal prefix string in m_stringArena
@@ -1749,6 +2069,9 @@ namespace StringPatternMatchDetail
     // Parses a pattern, extracts its literal prefix, calculates its hash, and
     // maps it to the provided context.
     //
+    // WARNING: This method is not thread-safe. Do not call AddPattern() concurrently with 
+    // Search() or other AddPattern() calls without external synchronization.
+    //
     // Parameters:
     //   pattern        - Pointer to the character array defining the wildcard pattern.
     //   patternLength  - The length of the pattern in characters.
@@ -1918,6 +2241,11 @@ namespace StringPatternMatchDetail
         // Push to the contiguous arena. Because m_hashMap stores indices rather than pointers,
         // std::vector reallocations will not invalidate the map tracking.
         m_patternArena.push_back(std::move(newEntry));
+
+#if defined(_M_ARM64) || defined(__aarch64__) || defined(_M_ARM) || defined(__arm__)
+        // Ensure newly registered structures are visible across weakly ordered architectures
+        std::atomic_thread_fence(std::memory_order_release);
+#endif
 
         return true;
     }
@@ -2206,6 +2534,8 @@ namespace StringPatternMatchDetail
     // Executes a single-match search, returning true and populating PatternContext
     // upon the first successful match.
     //
+    // WARNING: This method is not thread-safe if called concurrently with AddPattern().
+    //
     // Parameters:
     //   text           - Pointer to the target text buffer to be evaluated.
     //   textLength     - The length of the target text in characters.
@@ -2233,6 +2563,8 @@ namespace StringPatternMatchDetail
 
     // -------------------------------------------------------------------------------------------
     // Executes a multi-match search, appending all matching contexts into the vector.
+    //
+    // WARNING: This method is not thread-safe if called concurrently with AddPattern().
     //
     // Parameters:
     //   text            - Pointer to the target text buffer to be evaluated.
@@ -2278,7 +2610,12 @@ namespace StringPatternMatchDetail
     bool StringPatternMatchImpl<CharT, TContext, TPolicy>::SearchInternal(const CharT* text,
                                                                           uint32_t     textLength,
                                                                           F&&          collector) const noexcept
-    {
+    {      
+#if defined(_M_ARM64) || defined(__aarch64__) || defined(_M_ARM) || defined(__arm__)
+        // Enforce load visibility on loosely-ordered memory architectures before reading published memory
+        std::atomic_thread_fence(std::memory_order_acquire);
+#endif
+
         // Global minimum match length rejection guard
         if (m_lengthVector.empty() || textLength < m_globalMinMatchLength)
         {
@@ -2378,6 +2715,7 @@ namespace StringPatternMatchDetail
             {
                 hashValue = m_hashFunction(text + textIndex, delta, hashValue, m_policy);
             }
+
             textIndex = matchLength;
 
             // Fast-path rejection: Check hash-existence filter before touching hash map memory
@@ -2472,7 +2810,7 @@ namespace StringPatternMatchDetail
         return false;
     }
 
-// -------------------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------------------------
     // Non-recursive state machine that evaluates the wildcard suffix against the string.
     //
     // Parameters:
@@ -2759,7 +3097,11 @@ namespace StringPatternMatchDetail
 
                     p++;
                     s++;
-                    remainingMinLength--;
+                    if (remainingMinLength > 0)
+                    {
+                        remainingMinLength--;
+                    }
+
                     continue; // Match success, resume next iteration
                 }
 
@@ -2776,7 +3118,11 @@ namespace StringPatternMatchDetail
                                 {
                                     p += 2;
                                     s++;
-                                    remainingMinLength--;
+                                    if (remainingMinLength > 0) 
+                                    {
+                                        remainingMinLength--;
+                                    }
+
                                     continue; // Match success, resume next iteration
                                 }
                             }
@@ -2786,7 +3132,11 @@ namespace StringPatternMatchDetail
                                 {
                                     p += 2;
                                     s++;
-                                    remainingMinLength--;
+                                    if (remainingMinLength > 0) 
+                                    {
+                                        remainingMinLength--;
+                                    }
+
                                     continue; // Match success, resume next iteration
                                 }
                             }
@@ -2808,7 +3158,11 @@ namespace StringPatternMatchDetail
                         {
                             p++;
                             s++;
-                            remainingMinLength--;
+                            if (remainingMinLength > 0) 
+                            {
+                                remainingMinLength--;
+                            }
+
                             continue; // Match success, resume next iteration
                         }
                     }
@@ -2818,7 +3172,11 @@ namespace StringPatternMatchDetail
                         {
                             p++;
                             s++;
-                            remainingMinLength--;
+                            if (remainingMinLength > 0) 
+                            {
+                                remainingMinLength--;
+                            }
+
                             continue; // Match success, resume next iteration
                         }
                     }
@@ -2921,6 +3279,9 @@ public:
     // -------------------------------------------------------------------------------------------
     // Registers a pattern via string_view wrapper, forwarding to the core engine.
     //
+    // WARNING: This method is not thread-safe. Do not mutate the engine concurrently 
+    // with other operations. Use an atomic pointer swap (RCU) to apply updates.
+    //
     // Parameters:
     //   pattern        - The string view representing the wildcard pattern.
     //   wildScope      - The boundary scope to apply for wildcard operators.
@@ -2946,6 +3307,9 @@ public:
     // -------------------------------------------------------------------------------------------
     // Searches for the first matching pattern context against the provided target text.
     //
+    // WARNING: This method is not thread-safe if called concurrently with AddPattern(). 
+    // Use an atomic pointer swap (RCU) to apply updates.
+    //
     // Parameters:
     //   text           - The string view representing the target text.
     //   patternContext - Out-pointer receiving the matched payload context on success.
@@ -2967,6 +3331,9 @@ public:
     
     // -------------------------------------------------------------------------------------------
     // Searches and collects all matching pattern contexts against the provided target text.
+    //
+    // WARNING: This method is not thread-safe if called concurrently with AddPattern(). 
+    // Use an atomic pointer swap (RCU) to apply updates.
     //
     // Parameters:
     //   text            - The string view representing the target text.
@@ -3003,3 +3370,7 @@ using StringPatternMatchW = StringPatternMatch<wchar_t, TContext, CaseSensitiveP
 // Wide strings: Safe Unicode wide-character case-folding
 template <typename TContext>
 using CaseInsensitivePatternMatchW = StringPatternMatch<wchar_t, TContext, UnicodeCaseFoldPolicy<wchar_t>>;
+
+#if (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(_M_X64))
+#pragma GCC diagnostic pop
+#endif

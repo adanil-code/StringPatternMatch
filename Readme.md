@@ -37,6 +37,7 @@ To support file system filtering and path routing across platforms, the engine n
 * **Multi-Pattern Matching & Early-Exit:** Indexes patterns concurrently across prefix length groups, evaluating target text against the registered rules in a single pass while using multi-level bitmask and hash filters to discard non-matching inputs early.
 * **SIMD Hardware Acceleration & Dynamic Dispatch:** Dynamically evaluates CPU capabilities at runtime on x86/x64 systems via CPUID and OSXSAVE to dispatch optimal SIMD backends (AVX-512, AVX2, or SSE4.1). It uses native 128-bit NEON instructions on ARM architectures and provides a portable scalar fallback path.
 * **Allocation-Free Matching Path:** Following pattern registration, the engine performs no internal heap allocations during candidate evaluation. (The caller-provided output vector used for multi-match collection may allocate memory as it expands).
+* **Lock-Free Read-Copy-Update (RCU) Concurrency:** The engine intentionally avoids internal read/write locks to preserve multi-GB/s SIMD cache throughput. Concurrent updates are achieved via atomic pointer swaps (RCU), ensuring zero contention on the read path.
 * **4096-Bit Hash-Existence Filter:** Implements a 4096-bit bitmap existence filter (`m_hashFilter`) alongside prefix length bitmasks to discard non-matching candidates before accessing hash map buckets.
 * **64-Bit SWAR Literal Signatures:** Extracts 64-bit SIMD Within A Register (SWAR) prefix signatures and tail anchors for rapid mismatch rejection. Pure ASCII blocks under case-insensitive policies are folded in parallel using bitwise SWAR arithmetic.
 * **Non-Recursive State Machine:** Wildcard evaluation relies on an iterative, non-recursive state machine with fast-forward linear scanning, eliminating recursive stack growth and avoiding stack exhaustion on complex or pathological inputs.
@@ -51,7 +52,7 @@ This engine is the user-mode version of the Windows kernel string pattern match 
 
 ### High-Level Design
 The engine uses a two-phase architecture to maximize CPU efficiency during evaluation:
-1. **Registration Phase (`AddPattern`):** When a pattern is added, the engine parses it into an exact literal prefix, a wildcard middle segment, and an optional trailing literal anchor. The pattern is validated against the active case policy and stored in stable deque storage. The literal prefix is hashed via the active SIMD or scalar backend, and its hash is stamped into a 4096-bit hash-existence filter. Prefix lengths are tracked in a 256-bit bitmask and a sorted unique length vector. A 64-bit SWAR prefix signature, the minimum required match length, and tail metadata are calculated and stored in a contiguous pattern entry arena. Hash collisions are indexed using intrusive FIFO bucket chains. Note: `AddPattern()` and `Clear()` mutate internal structures, while `Search()` reads them; callers must provide external synchronization if mutating concurrently across threads.
+1. **Registration Phase (`AddPattern`):** When a pattern is added, the engine parses it into an exact literal prefix, a wildcard middle segment, and an optional trailing literal anchor. The pattern is validated against the active case policy and stored in stable deque storage. The literal prefix is hashed via the active SIMD or scalar backend, and its hash is stamped into a 4096-bit hash-existence filter. Prefix lengths are tracked in a 256-bit bitmask and a sorted unique length vector. A 64-bit SWAR prefix signature, the minimum required match length, and tail metadata are calculated and stored in a contiguous pattern entry arena. Hash collisions are indexed using intrusive FIFO bucket chains.
 2. **Search Phase (`Search`):** Target text is validated against the global minimum registered length. 
    * *Exact-Match Fast Path:* If no wildcards are registered across the entire engine, it executes a direct exact-string check using the prefix length bitmask, a single full-text hash computation, and the hash existence filter, bypassing iterative length loops.
    * *Wildcard Evaluation Path:* If wildcards are present, the engine advances through registered prefix lengths using an incremental rolling polynomial hash. It tests the 4096-bit filter first. On a filter hit, it probes the hash table bucket, validates the 64-bit SWAR signature and precomputed minimum length, checks the anchored literal tail, and verifies the prefix. If the prefix and tail pass, the remaining unparsed text is evaluated by the non-recursive wildcard state machine.
@@ -84,6 +85,15 @@ The engine uses an iterative state machine with fast-forward linear scanning:
 * **Fast-Forward Scanning:** When an asterisk (`*`) is processed, the engine identifies the literal character that immediately follows it and uses optimized scan routines to locate candidate positions. In case-sensitive or standard ASCII contexts, it leverages vector-backed routines (`std::memchr` / `std::wmemchr`). In case-insensitive or segment-limited contexts, it advances through the text using a 4-character unrolled loop.
 * **Bounded Backtracking:** The engine tracks backtracking state using pointer references (`lastStarPattern`, `lastStarString`) and length counters. If a downstream mismatch occurs, the scanner jumps back to the most recent wildcard branch without recursive function calls.
 * **Path Boundary Containment:** When `WildcardScope::PathSegment` is active, the fast-forward scanner halts and rejects matches if an operating-system directory separator is encountered, ensuring wildcard evaluations do not cross folder boundaries.
+
+### 5. Thread Safety & Concurrency Architecture
+This engine is intentionally **NOT** thread-safe for concurrent mutation and querying to preserve peak SIMD cache performance. Do NOT use `std::mutex` to protect `Search()` and `AddPattern()`, as this will serialize the read path and cause massive CPU cache-line invalidation.
+
+Instead, utilize the **Read-Copy-Update (RCU) / Atomic Swap pattern**:
+1. Construct a new `StringPatternMatch` instance offline in a background thread.
+2. Populate the new instance with the updated pattern rules via `AddPattern()`.
+3. Atomically swap the active engine pointer (e.g., using `std::atomic<std::shared_ptr<T>>`).
+4. Readers atomically load the pointer and execute `Search()` completely lock-free.
 
 ---
 
@@ -163,6 +173,8 @@ void Clear() noexcept;
 
 #### Pattern Registration (`AddPattern`)
 
+**WARNING:** This method is not thread-safe. Do not mutate the engine concurrently with other operations. Use an atomic pointer swap (RCU) to apply updates.
+
 ```cpp
 // std::string_view Overload
 bool AddPattern(StringViewType pattern,
@@ -192,6 +204,8 @@ bool AddPattern(const CharT*  pattern,
 
 #### Single-Match Search (`Search`)
 
+**WARNING:** This method is not thread-safe if called concurrently with `AddPattern()`. Use an atomic pointer swap (RCU) to apply updates.
+
 ```cpp
 // std::string_view Overload
 bool Search(StringViewType text,
@@ -216,6 +230,8 @@ bool Search(const CharT* text,
 ---
 
 #### Multi-Match Search (`Search`)
+
+**WARNING:** This method is not thread-safe if called concurrently with `AddPattern()`. Use an atomic pointer swap (RCU) to apply updates.
 
 ```cpp
 // std::string_view Overload

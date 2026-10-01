@@ -376,11 +376,19 @@ struct CustomCasePolicy
 };
 
 //-------------------------------------------------------------------------------------------
-// OS-Specific Directory Separator
+// Detail Namespace & OS Architecture Definitions
 //-------------------------------------------------------------------------------------------
 
 namespace StringPatternMatchDetail
 {
+    // Constexpr resolution of the native host OS
+    constexpr bool kIsWindows =
+#if defined(_WIN32)
+        true;
+#else
+        false;
+#endif
+
     // -------------------------------------------------------------------------------------------
     // Determines if a character is the strict native path separator for the target OS.
     // Used exclusively when WildcardScope::PathSegment is active to halt wildcard expansion.
@@ -395,11 +403,14 @@ namespace StringPatternMatchDetail
     template <SupportedChar CharT>
     inline bool IsPathSeparator(CharT character) noexcept
     {
-#if defined(_WIN32)
-        return character == static_cast<CharT>('\\');
-#else
-        return character == static_cast<CharT>('/');
-#endif
+        if constexpr (kIsWindows)
+        {
+            return character == static_cast<CharT>('\\');
+        }
+        else
+        {
+            return character == static_cast<CharT>('/');
+        }
     }
 
     //-------------------------------------------------------------------------------------------
@@ -844,40 +855,62 @@ namespace StringPatternMatchDetail
         static constexpr uint32_t Step = 4; // Number of code units evaluated per 128-bit vector iteration during polynomial hashing.
                                             // Prefix comparisons utilize wider byte-level strides.
 
+        // -------------------------------------------------------------------------------------------
+        // Loads up to 4 characters from memory and zero-extends them into 32-bit integers
+        // across a 128-bit vector register to prevent integer overflow during hash arithmetic.
+        // -------------------------------------------------------------------------------------------
         template <SupportedChar CharT>
         SPM_TARGET_SSE41 static inline VecT Load(const CharT* ptr)
         {
             if constexpr (std::is_same_v<CharT, char>)
             {
+                // Extend 8-bit narrow characters to 32-bit integers
                 return _mm_cvtepu8_epi32(_mm_cvtsi32_si128(*reinterpret_cast<const int32_t*>(ptr)));
+            }
+            else if constexpr (sizeof(CharT) == 2)
+            {
+                // Extend 16-bit wide characters to 32-bit integers
+                return _mm_cvtepu16_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(ptr)));
             }
             else
             {
-#if WCHAR_MAX <= 0xFFFF
-                return _mm_cvtepu16_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(ptr)));
-#else
+                // Load natively 32-bit wide characters directly
                 return _mm_loadu_si128(reinterpret_cast<const __m128i*>(ptr));
-#endif
             }
         }
 
+        // -------------------------------------------------------------------------------------------
+        // Checks if any 32-bit lane contains a value outside the 7-bit ASCII range (> 127).
+        // Used to trigger scalar fallbacks for complex Unicode folding policies.
+        // -------------------------------------------------------------------------------------------
         SPM_TARGET_SSE41 static inline bool HasNonAscii(VecT v)
         {
             return !_mm_testz_si128(v, _mm_set1_epi32(~127));
         }
 
+        // -------------------------------------------------------------------------------------------
+        // Performs branchless ASCII case-folding (lowercase to uppercase).
+        // Identifies characters between 'a' and 'z' and subtracts 32 from those specific lanes.
+        // -------------------------------------------------------------------------------------------
         SPM_TARGET_SSE41 static inline VecT CaseFold(VecT v)
         {
             __m128i isLower = _mm_and_si128(_mm_cmpgt_epi32(v, _mm_set1_epi32('a' - 1)), _mm_cmplt_epi32(v, _mm_set1_epi32('z' + 1)));
             return _mm_sub_epi32(v, _mm_and_si128(isLower, _mm_set1_epi32(32)));
         }
 
+        // -------------------------------------------------------------------------------------------
+        // Performs an exact equality comparison across all lanes and validates the resulting bitmask.
+        // -------------------------------------------------------------------------------------------
         SPM_TARGET_SSE41 static inline bool CmpEq(VecT a,
                                                   VecT b)
         {
             return _mm_movemask_epi8(_mm_cmpeq_epi32(a, b)) == 0xFFFF;
         }
 
+        // -------------------------------------------------------------------------------------------
+        // Executes a 4-lane polynomial hash multiplication utilizing prime 131.
+        // Fuses independent multiplications and additions to maximize port throughput.
+        // -------------------------------------------------------------------------------------------
         SPM_TARGET_SSE41 static inline uint64_t HashBlock(VecT chars32)
         {
             const __m128i weights = _mm_setr_epi32(131 * 131 * 131, 131 * 131, 131, 1);
@@ -891,6 +924,9 @@ namespace StringPatternMatchDetail
 
         SPM_GENERATE_PROCESS_CASING(SPM_TARGET_SSE41)
 
+        // -------------------------------------------------------------------------------------------
+        // Computes the 64-bit polynomial rolling hash of the text block using 128-bit operations.
+        // -------------------------------------------------------------------------------------------
         template <SupportedChar CharT, bool IsCaseInsensitive, typename TPolicy>
         SPM_TARGET_SSE41 static uint64_t CalculateHash(const CharT* text,
                                                        uint32_t     textLength,
@@ -900,6 +936,10 @@ namespace StringPatternMatchDetail
             SPM_GENERATE_CALCULATE_HASH(TraitsSse41)
         }
 
+        // -------------------------------------------------------------------------------------------
+        // Verifies prefix equality against the text chunk using wide vector comparisons.
+        // Iterates in vector-sized steps and falls back to scalar processing for unaligned tails.
+        // -------------------------------------------------------------------------------------------
         template <SupportedChar CharT, typename TPolicy>
         SPM_TARGET_SSE41 static bool ComparePrefix(const CharT* upperText1,
                                                    const CharT* text2,
@@ -916,47 +956,70 @@ namespace StringPatternMatchDetail
         static constexpr uint32_t Step = 8; // Number of code units evaluated per 256-bit vector iteration during polynomial hashing.
                                             // Prefix comparisons utilize wider byte-level strides.
 
+        // -------------------------------------------------------------------------------------------
+        // Loads up to 8 characters from memory and zero-extends them into 32-bit integers
+        // across a 256-bit vector register to prevent integer overflow during hash arithmetic.
+        // -------------------------------------------------------------------------------------------
         template <SupportedChar CharT>
         SPM_TARGET_AVX2 static inline VecT Load(const CharT* ptr)
         {
             if constexpr (std::is_same_v<CharT, char>)
             {
+                // Extend 8-bit narrow characters to 32-bit integers
                 return _mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(ptr)));
+            }
+            else if constexpr (sizeof(CharT) == 2)
+            {
+                // Extend 16-bit wide characters to 32-bit integers
+                return _mm256_cvtepu16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(ptr)));
             }
             else
             {
-#if WCHAR_MAX <= 0xFFFF
-                return _mm256_cvtepu16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(ptr)));
-#else
+                // Load natively 32-bit wide characters directly
                 return _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptr));
-#endif
             }
         }
 
+        // -------------------------------------------------------------------------------------------
+        // Checks if any 32-bit lane contains a value outside the 7-bit ASCII range (> 127).
+        // Used to trigger scalar fallbacks for complex Unicode folding policies.
+        // -------------------------------------------------------------------------------------------
         SPM_TARGET_AVX2 static inline bool HasNonAscii(VecT v)
         {
             return !_mm256_testz_si256(v, _mm256_set1_epi32(~127));
         }
 
+        // -------------------------------------------------------------------------------------------
+        // Performs branchless ASCII case-folding (lowercase to uppercase).
+        // Identifies characters between 'a' and 'z' and subtracts 32 from those specific lanes.
+        // -------------------------------------------------------------------------------------------
         SPM_TARGET_AVX2 static inline VecT CaseFold(VecT v)
         {
-            __m256i isLower = _mm256_and_si256(_mm256_cmpgt_epi32(v, _mm256_set1_epi32('a' - 1)), _mm256_cmpgt_epi32(_mm256_set1_epi32('z' + 1), v));
+            __m256i isLower = _mm256_and_si256(_mm256_cmpgt_epi32(v, _mm256_set1_epi32('a' - 1)), 
+                                               _mm256_cmpgt_epi32(_mm256_set1_epi32('z' + 1), v));
             return _mm256_sub_epi32(v, _mm256_and_si256(isLower, _mm256_set1_epi32(32)));
         }
 
+        // -------------------------------------------------------------------------------------------
+        // Performs an exact equality comparison across all lanes and validates the resulting bitmask.
+        // -------------------------------------------------------------------------------------------
         SPM_TARGET_AVX2 static inline bool CmpEq(VecT a,
                                                  VecT b)
         {
             return static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi32(a, b))) == 0xFFFFFFFF;
         }
 
+        // -------------------------------------------------------------------------------------------
+        // Executes an 8-lane polynomial hash multiplication utilizing prime 131.
+        // Fuses independent multiplications and additions to maximize port throughput.
+        // -------------------------------------------------------------------------------------------
         SPM_TARGET_AVX2 static inline uint64_t HashBlock(VecT chars32)
         {
             const __m128i w128 = _mm_setr_epi32(131 * 131 * 131, 131 * 131, 131, 1);
             const __m256i w256 = _mm256_set_m128i(w128, w128);
 
-            __m256i mul1 = _mm256_mul_epu32(chars32, w256);
-            __m256i mul2 = _mm256_mul_epu32(_mm256_srli_si256(chars32, 4), _mm256_srli_si256(w256, 4));
+            __m256i mul1  = _mm256_mul_epu32(chars32, w256);
+            __m256i mul2  = _mm256_mul_epu32(_mm256_srli_si256(chars32, 4), _mm256_srli_si256(w256, 4));
             __m256i sum64 = _mm256_add_epi64(mul1, mul2);
             __m256i total = _mm256_add_epi64(sum64, _mm256_unpackhi_epi64(sum64, sum64));
 
@@ -969,6 +1032,9 @@ namespace StringPatternMatchDetail
 
         SPM_GENERATE_PROCESS_CASING(SPM_TARGET_AVX2)
 
+        // -------------------------------------------------------------------------------------------
+        // Computes the 64-bit polynomial rolling hash of the text block using 256-bit operations.
+        // -------------------------------------------------------------------------------------------
         template <SupportedChar CharT, bool IsCaseInsensitive, typename TPolicy>
         SPM_TARGET_AVX2 static uint64_t CalculateHash(const CharT* text,
                                                       uint32_t     textLength,
@@ -978,6 +1044,10 @@ namespace StringPatternMatchDetail
             SPM_GENERATE_CALCULATE_HASH(TraitsAvx2)
         }
 
+        // -------------------------------------------------------------------------------------------
+        // Verifies prefix equality against the text chunk using wide vector comparisons.
+        // Iterates in vector-sized steps and falls back to scalar processing for unaligned tails.
+        // -------------------------------------------------------------------------------------------
         template <SupportedChar CharT, typename TPolicy>
         SPM_TARGET_AVX2 static bool ComparePrefix(const CharT* upperText1,
                                                   const CharT* text2,
@@ -987,14 +1057,17 @@ namespace StringPatternMatchDetail
             uint32_t i = 0;
             if constexpr (std::is_same_v<CharT, char>)
             {
+                // Process 32 narrow chars per iteration
                 constexpr uint32_t VecStep = 32;
 
+                // Preload constants for branchless ASCII case folding
                 const __m256i aMin    = _mm256_set1_epi8('a' - 1);
                 const __m256i zMax    = _mm256_set1_epi8('z' + 1);
                 const __m256i foldSub = _mm256_set1_epi8(32);
 
                 for (; i + VecStep - 1 < compareLength; i += VecStep)
                 {
+                    // Fallback to scalar verification for unsupported dynamic/custom CI policies
                     if constexpr (!std::same_as<TPolicy, AsciiCaseFoldPolicy<char>> && TPolicy::isCaseInsensitive)
                     {
                         for (uint32_t k = 0; k < VecStep; ++k)
@@ -1007,26 +1080,30 @@ namespace StringPatternMatchDetail
                         continue;
                     }
 
+                    // Load 256-bit vector blocks of pattern and target text
                     __m256i c1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(upperText1 + i));
                     __m256i raw = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(text2 + i));
 
                     if constexpr (TPolicy::isCaseInsensitive)
                     {
+                        // Identify lowercase ASCII boundaries and subtract 32
                         __m256i isLower = _mm256_and_si256(_mm256_cmpgt_epi8(raw, aMin), _mm256_cmpgt_epi8(zMax, raw));
                         raw = _mm256_sub_epi8(raw, _mm256_and_si256(isLower, foldSub));
                     }
 
+                    // Verify equality of the 32-byte block and fail on first mismatch
                     if (static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(c1, raw))) != 0xFFFFFFFF)
                     {
                         return false;
                     }
                 }
             }
-            else
+            else if constexpr (sizeof(CharT) == 2)
             {
-#if WCHAR_MAX <= 0xFFFF
+                // Process 16 wide chars per iteration (16-bit encoding)
                 constexpr uint32_t VecStep = 16;
 
+                // Preload constants for branchless ASCII case folding
                 const __m256i aMin         = _mm256_set1_epi16('a' - 1);
                 const __m256i zMax         = _mm256_set1_epi16('z' + 1);
                 const __m256i foldSub      = _mm256_set1_epi16(32);
@@ -1038,8 +1115,10 @@ namespace StringPatternMatchDetail
 
                     if constexpr (!std::same_as<TPolicy, AsciiCaseFoldPolicy<wchar_t>> && TPolicy::isCaseInsensitive)
                     {
+                        // If policy supports Unicode, check if chunk contains non-ASCII characters that require scalar folding
                         if (!_mm256_testz_si256(raw, nonAsciiMask))
                         {
+                            // Fallback to scalar verification for this block
                             for (uint32_t k = 0; k < VecStep; ++k)
                             {
                                 if (upperText1[i + k] != policy(text2[i + k]))
@@ -1051,6 +1130,7 @@ namespace StringPatternMatchDetail
                             continue;
                         }
                     }
+                    
                     __m256i c1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(upperText1 + i));
 
                     if constexpr (TPolicy::isCaseInsensitive)
@@ -1064,9 +1144,13 @@ namespace StringPatternMatchDetail
                         return false;
                     }
                 }
-#else
+            }
+            else
+            {
+                // Process 8 wide chars per iteration (32-bit encoding)
                 constexpr uint32_t VecStep = 8;
 
+                // Preload constants for branchless ASCII case folding
                 const __m256i aMin         = _mm256_set1_epi32('a' - 1);
                 const __m256i zMax         = _mm256_set1_epi32('z' + 1);
                 const __m256i foldSub      = _mm256_set1_epi32(32);
@@ -1078,6 +1162,7 @@ namespace StringPatternMatchDetail
 
                     if constexpr (!std::same_as<TPolicy, AsciiCaseFoldPolicy<wchar_t>> && TPolicy::isCaseInsensitive)
                     {
+                        // If policy supports Unicode, check if chunk contains non-ASCII characters that require scalar folding
                         if (!_mm256_testz_si256(raw, nonAsciiMask))
                         {
                             for (uint32_t k = 0; k < VecStep; ++k)
@@ -1091,6 +1176,7 @@ namespace StringPatternMatchDetail
                             continue;
                         }
                     }
+                    
                     __m256i c1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(upperText1 + i));
 
                     if constexpr (TPolicy::isCaseInsensitive)
@@ -1104,9 +1190,9 @@ namespace StringPatternMatchDetail
                         return false;
                     }
                 }
-#endif
             }
 
+            // Remainder scalar loop for unaligned block tails
             for (; i < compareLength; i++)
             {
                 if (upperText1[i] != policy(text2[i]))
@@ -1125,40 +1211,64 @@ namespace StringPatternMatchDetail
         static constexpr uint32_t Step = 16; // Number of code units evaluated per 512-bit vector iteration during polynomial hashing.
                                              // Prefix comparisons utilize wider byte-level strides.
 
+        // -------------------------------------------------------------------------------------------
+        // Loads up to 16 characters from memory and zero-extends them into 32-bit integers
+        // across a 512-bit vector register to prevent integer overflow during hash arithmetic.
+        // -------------------------------------------------------------------------------------------
         template <SupportedChar CharT>
         SPM_TARGET_AVX512 static inline VecT Load(const CharT* ptr)
         {
             if constexpr (std::is_same_v<CharT, char>)
             {
+                // Extend 8-bit narrow characters to 32-bit integers
                 return _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(ptr)));
+            }
+            else if constexpr (sizeof(CharT) == 2)
+            {
+                // Extend 16-bit wide characters to 32-bit integers
+                return _mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptr)));
             }
             else
             {
-#if WCHAR_MAX <= 0xFFFF
-                return _mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptr)));
-#else
+                // Load natively 32-bit wide characters directly
                 return _mm512_loadu_si512(reinterpret_cast<const void*>(ptr));
-#endif
             }
         }
 
+        // -------------------------------------------------------------------------------------------
+        // Checks if any 32-bit lane contains a value outside the 7-bit ASCII range (> 127).
+        // Used to trigger scalar fallbacks for complex Unicode folding policies.
+        // -------------------------------------------------------------------------------------------
         SPM_TARGET_AVX512 static inline bool HasNonAscii(VecT v)
         {
             return _mm512_test_epi32_mask(v, _mm512_set1_epi32(~127)) != 0;
         }
 
+        // -------------------------------------------------------------------------------------------
+        // Performs branchless ASCII case-folding using an optimized unsigned delta range check.
+        // Subtracts 'a' and utilizes AVX-512 unsigned mask comparisons (<= 25) to save instructions.
+        // -------------------------------------------------------------------------------------------
         SPM_TARGET_AVX512 static inline VecT CaseFold(VecT v)
-        {
-            __mmask16 isLower = _mm512_cmpgt_epi32_mask(v, _mm512_set1_epi32('a' - 1)) & _mm512_cmplt_epi32_mask(v, _mm512_set1_epi32('z' + 1));
+        {            
+            __m512i diff = _mm512_sub_epi32(v, _mm512_set1_epi32('a'));
+            __mmask16 isLower = _mm512_cmple_epu32_mask(diff, _mm512_set1_epi32(25));
+   
             return _mm512_mask_sub_epi32(v, isLower, v, _mm512_set1_epi32(32));
         }
 
+        // -------------------------------------------------------------------------------------------
+        // Performs an exact equality comparison across all lanes and validates the resulting bitmask.
+        // -------------------------------------------------------------------------------------------
         SPM_TARGET_AVX512 static inline bool CmpEq(VecT a,
                                                    VecT b)
         {
             return _mm512_cmpneq_epi32_mask(a, b) == 0;
         }
 
+        // -------------------------------------------------------------------------------------------
+        // Executes a 16-lane polynomial hash multiplication utilizing prime 131.
+        // Fuses independent multiplications and additions to maximize port throughput.
+        // -------------------------------------------------------------------------------------------
         SPM_TARGET_AVX512 static inline uint64_t HashBlock(VecT chars32)
         {
             const __m512i w512 = _mm512_broadcast_i32x4(_mm_setr_epi32(131 * 131 * 131, 131 * 131, 131, 1));
@@ -1183,6 +1293,9 @@ namespace StringPatternMatchDetail
 
         SPM_GENERATE_PROCESS_CASING(SPM_TARGET_AVX512)
 
+        // -------------------------------------------------------------------------------------------
+        // Computes the 64-bit polynomial rolling hash of the text block using 512-bit operations.
+        // -------------------------------------------------------------------------------------------
         template <SupportedChar CharT, bool IsCaseInsensitive, typename TPolicy>
         SPM_TARGET_AVX512 static uint64_t CalculateHash(const CharT* text,
                                                         uint32_t     textLength,
@@ -1192,6 +1305,10 @@ namespace StringPatternMatchDetail
             SPM_GENERATE_CALCULATE_HASH(TraitsAvx512)
         }
 
+        // -------------------------------------------------------------------------------------------
+        // Verifies prefix equality against the text chunk using wide vector comparisons.
+        // Iterates in vector-sized steps and falls back to scalar processing for unaligned tails.
+        // -------------------------------------------------------------------------------------------
         template <SupportedChar CharT, typename TPolicy>
         SPM_TARGET_AVX512 static bool ComparePrefix(const CharT* upperText1,
                                                     const CharT* text2,
@@ -1199,16 +1316,20 @@ namespace StringPatternMatchDetail
                                                     TPolicy      policy) noexcept
         {
             uint32_t i = 0;
+            
             if constexpr (std::is_same_v<CharT, char>)
             {
+                // Process 64 narrow chars per iteration
                 constexpr uint32_t VecStep = 64;
 
-                const __m512i aMin    = _mm512_set1_epi8('a' - 1);
-                const __m512i zMax    = _mm512_set1_epi8('z' + 1);
-                const __m512i foldSub = _mm512_set1_epi8(32);
+                // Preload constants for branchless ASCII case folding
+                const __m512i aBase    = _mm512_set1_epi8('a');
+                const __m512i rangeMax = _mm512_set1_epi8(25);
+                const __m512i foldSub  = _mm512_set1_epi8(32);
 
                 for (; i + VecStep - 1 < compareLength; i += VecStep)
                 {
+                    // Fallback to scalar verification for unsupported dynamic/custom CI policies
                     if constexpr (!std::same_as<TPolicy, AsciiCaseFoldPolicy<char>> && TPolicy::isCaseInsensitive)
                     {
                         for (uint32_t k = 0; k < VecStep; ++k)
@@ -1222,28 +1343,35 @@ namespace StringPatternMatchDetail
                         continue;
                     }
 
-                    __m512i c1 = _mm512_loadu_si512(reinterpret_cast<const void*>(upperText1 + i));
+                    // Load 512-bit vector blocks of pattern and target text
+                    __m512i c1  = _mm512_loadu_si512(reinterpret_cast<const void*>(upperText1 + i));
                     __m512i raw = _mm512_loadu_si512(reinterpret_cast<const void*>(text2 + i));
 
                     if constexpr (TPolicy::isCaseInsensitive)
                     {
-                        __mmask64 isLower = _mm512_cmpgt_epi8_mask(raw, aMin) & _mm512_cmplt_epi8_mask(raw, zMax);
+                        // Calculate offset from 'a' base
+                        __m512i   diff    = _mm512_sub_epi8(raw, aBase);
+                        // Single unsigned check ensures value was between 'a' and 'z'
+                        __mmask64 isLower = _mm512_cmple_epu8_mask(diff, rangeMax);
+                        // Masked subtraction directly converts matching elements
                         raw = _mm512_mask_sub_epi8(raw, isLower, raw, foldSub);
                     }
 
+                    // Verify mask equality and fail on first mismatch
                     if (_mm512_cmpneq_epi8_mask(c1, raw) != 0)
                     {
                         return false;
                     }
                 }
             }
-            else
+            else if constexpr (sizeof(CharT) == 2)
             {
-            #if WCHAR_MAX <= 0xFFFF
+                // Process 32 wide chars per iteration (16-bit encoding)
                 constexpr uint32_t VecStep = 32;
 
-                const __m512i aMin         = _mm512_set1_epi16('a' - 1);
-                const __m512i zMax         = _mm512_set1_epi16('z' + 1);
+                // Preload constants for branchless ASCII case folding
+                const __m512i aBase        = _mm512_set1_epi16('a');
+                const __m512i rangeMax     = _mm512_set1_epi16(25);
                 const __m512i foldSub      = _mm512_set1_epi16(32);
                 const __m512i nonAsciiMask = _mm512_set1_epi16(static_cast<short>(~127));
 
@@ -1253,8 +1381,10 @@ namespace StringPatternMatchDetail
 
                     if constexpr (!std::same_as<TPolicy, AsciiCaseFoldPolicy<wchar_t>> && TPolicy::isCaseInsensitive)
                     {
+                        // If policy supports Unicode, check if chunk contains non-ASCII characters that require scalar folding
                         if (_mm512_test_epi16_mask(raw, nonAsciiMask) != 0)
                         {
+                            // Fallback to scalar verification for this block
                             for (uint32_t k = 0; k < VecStep; ++k)
                             {
                                 if (upperText1[i + k] != policy(text2[i + k]))
@@ -1266,23 +1396,34 @@ namespace StringPatternMatchDetail
                             continue;
                         }
                     }
+                    
                     __m512i c1 = _mm512_loadu_si512(reinterpret_cast<const void*>(upperText1 + i));
 
                     if constexpr (TPolicy::isCaseInsensitive)
                     {
-                        __mmask32 isLower = _mm512_cmpgt_epi16_mask(raw, aMin) & _mm512_cmplt_epi16_mask(raw, zMax);
+                        // Calculate offset from 'a' base
+                        __m512i   diff    = _mm512_sub_epi16(raw, aBase);
+                        // Single unsigned check ensures value was between 'a' and 'z'
+                        __mmask32 isLower = _mm512_cmple_epu16_mask(diff, rangeMax);
+                        // Masked subtraction directly converts matching elements
                         raw = _mm512_mask_sub_epi16(raw, isLower, raw, foldSub);
                     }
+                    
+                    // Verify mask equality and fail on first mismatch
                     if (_mm512_cmpneq_epi16_mask(c1, raw) != 0)
                     {
                         return false;
                     }
                 }
-            #else
+            }
+            else
+            {
+                // Process 16 wide chars per iteration (32-bit encoding)
                 constexpr uint32_t VecStep = 16;
 
-                const __m512i aMin         = _mm512_set1_epi32('a' - 1);
-                const __m512i zMax         = _mm512_set1_epi32('z' + 1);
+                // Preload constants for branchless ASCII case folding
+                const __m512i aBase        = _mm512_set1_epi32('a');
+                const __m512i rangeMax     = _mm512_set1_epi32(25);
                 const __m512i foldSub      = _mm512_set1_epi32(32);
                 const __m512i nonAsciiMask = _mm512_set1_epi32(~127);
 
@@ -1292,6 +1433,7 @@ namespace StringPatternMatchDetail
 
                     if constexpr (!std::same_as<TPolicy, AsciiCaseFoldPolicy<wchar_t>> && TPolicy::isCaseInsensitive)
                     {
+                        // If policy supports Unicode, check if chunk contains non-ASCII characters that require scalar folding
                         if (_mm512_test_epi32_mask(raw, nonAsciiMask) != 0)
                         {
                             for (uint32_t k = 0; k < VecStep; ++k)
@@ -1301,26 +1443,32 @@ namespace StringPatternMatchDetail
                                     return false;
                                 }
                             }
+                            
                             continue;
                         }
                     }
+                    
                     __m512i c1 = _mm512_loadu_si512(reinterpret_cast<const void*>(upperText1 + i));
 
                     if constexpr (TPolicy::isCaseInsensitive)
                     {
-                        __mmask16 isLower = _mm512_cmpgt_epi32_mask(raw, aMin) & _mm512_cmplt_epi32_mask(raw, zMax);
+                        // Calculate offset from 'a' base
+                        __m512i   diff    = _mm512_sub_epi32(raw, aBase);
+                        // Single unsigned check ensures value was between 'a' and 'z'
+                        __mmask16 isLower = _mm512_cmple_epu32_mask(diff, rangeMax);
+                        // Masked subtraction directly converts matching elements
                         raw = _mm512_mask_sub_epi32(raw, isLower, raw, foldSub);
                     }
 
+                    // Verify mask equality and fail on first mismatch
                     if (_mm512_cmpneq_epi32_mask(c1, raw) != 0)
                     {
                         return false;
                     }
                 }
-            #endif
             }
 
-            // Process tail scalar remnants
+            // Remainder scalar loop for unaligned block tails
             for (; i < compareLength; i++)
             {
                 if (upperText1[i] != policy(text2[i]))
@@ -1343,8 +1491,8 @@ namespace StringPatternMatchDetail
     private:
         // -------------------------------------------------------------------------------------------
         // AArch64 / ARMv7 Compatibility Shims
-        // Abstracts hardware-specific horizontal vector reductions to eliminate inline preprocessor branching
-        // and prevent MSVC C++ type overload resolution failures on mapped typedefs.
+        // Abstracts hardware-specific horizontal vector reductions to eliminate inline preprocessor 
+        // branching and prevent MSVC C++ type overload resolution failures on mapped typedefs.
         // -------------------------------------------------------------------------------------------
 #if defined(__aarch64__)
         static inline uint16_t ReduceMax16(uint16x8_t v)
@@ -1438,6 +1586,10 @@ namespace StringPatternMatchDetail
 #endif
 
     public:
+        // -------------------------------------------------------------------------------------------
+        // Loads up to 4 characters from memory and zero-extends them into 32-bit integers
+        // across a 128-bit NEON vector register to prevent integer overflow during hash arithmetic.
+        // -------------------------------------------------------------------------------------------
         template <SupportedChar CharT>
         static inline VecT Load(const CharT* ptr)
         {
@@ -1451,27 +1603,37 @@ namespace StringPatternMatchDetail
                 
                 return vmovl_u16(vget_low_u16(vmovl_u8(v8)));
             }
-            else
+            else if constexpr (sizeof(CharT) == 2)
             {
-#if WCHAR_MAX <= 0xFFFF
                 uint64_t val;
                 std::memcpy(&val, ptr, sizeof(val));
                 
+                // Extend 16-bit wide characters to 32-bit integers
                 return vmovl_u16(vcreate_u16(val));
-#else
+            }
+            else
+            {
                 uint32x4_t val;
                 std::memcpy(&val, ptr, sizeof(val));
                 
+                // Load natively 32-bit wide characters directly
                 return val;
-#endif
             }
         }
 
+        // -------------------------------------------------------------------------------------------
+        // Checks if any 32-bit lane contains a value outside the 7-bit ASCII range (> 127).
+        // Used to trigger scalar fallbacks for complex Unicode folding policies.
+        // -------------------------------------------------------------------------------------------
         static inline bool HasNonAscii(VecT v)
         {
             return ReduceMax32(v) > 127;
         }
 
+        // -------------------------------------------------------------------------------------------
+        // Performs branchless ASCII case-folding (lowercase to uppercase).
+        // Identifies characters between 'a' and 'z' and subtracts 32 from those specific lanes.
+        // -------------------------------------------------------------------------------------------
         static inline VecT CaseFold(VecT v)
         {
             // Branchless range folding using unsigned delta: (v - 'a') < 26
@@ -1481,11 +1643,18 @@ namespace StringPatternMatchDetail
             return vsubq_u32(v, vandq_u32(isLower, vdupq_n_u32(32)));
         }
 
+        // -------------------------------------------------------------------------------------------
+        // Performs an exact equality comparison across all lanes and validates the resulting bitmask.
+        // -------------------------------------------------------------------------------------------
         static inline bool CmpEq(VecT a, VecT b)
         {
             return ReduceMin32(vceqq_u32(a, b)) == 0xFFFFFFFF;
         }
 
+        // -------------------------------------------------------------------------------------------
+        // Executes a 4-lane polynomial hash multiplication utilizing prime 131.
+        // Fuses independent multiplications and additions to maximize port throughput.
+        // -------------------------------------------------------------------------------------------
         static inline uint64_t HashBlock(VecT chars32)
         {
             // Vectorized weights static constant
@@ -1501,6 +1670,9 @@ namespace StringPatternMatchDetail
 
         SPM_GENERATE_PROCESS_CASING(SPM_TARGET_NEON)
 
+        // -------------------------------------------------------------------------------------------
+        // Computes the 64-bit polynomial rolling hash of the text block using 128-bit operations.
+        // -------------------------------------------------------------------------------------------
         template <SupportedChar CharT, bool IsCaseInsensitive, typename TPolicy>
         static uint64_t CalculateHash(const CharT* text,
                                       uint32_t     textLength,
@@ -1510,7 +1682,10 @@ namespace StringPatternMatchDetail
             SPM_GENERATE_CALCULATE_HASH(TraitsNeon)
         }
 
-        // Full 128-bit vectorization for prefix comparison (16 bytes/iteration)
+        // -------------------------------------------------------------------------------------------
+        // Verifies prefix equality against the text chunk using wide vector comparisons.
+        // Iterates in vector-sized steps and falls back to scalar processing for unaligned tails.
+        // -------------------------------------------------------------------------------------------
         template <SupportedChar CharT, typename TPolicy>
         static bool ComparePrefix(const CharT* upperText1,
                                   const CharT* text2,
@@ -1521,32 +1696,41 @@ namespace StringPatternMatchDetail
             
             if constexpr (std::is_same_v<CharT, char>)
             {
+                // Process 16 narrow characters per iteration
                 constexpr uint32_t VecStep = 16;
+
+                // Preload constants for branchless ASCII case folding
                 const uint8x16_t   aMin    = vdupq_n_u8('a');
                 const uint8x16_t   aMax    = vdupq_n_u8('z');
                 const uint8x16_t   sub32   = vdupq_n_u8(32);
 
                 for (; i + VecStep - 1 < compareLength; i += VecStep)
                 {
+                    // Load 128-bit vector blocks of pattern and target text
                     uint8x16_t c1  = vld1q_u8(reinterpret_cast<const uint8_t*>(upperText1 + i));
                     uint8x16_t raw = vld1q_u8(reinterpret_cast<const uint8_t*>(text2 + i));
 
                     if constexpr (TPolicy::isCaseInsensitive)
                     {
+                        // Check greater-equal 'a' and less-equal 'z' bounds
                         uint8x16_t isLower = vandq_u8(vcgeq_u8(raw, aMin), vcleq_u8(raw, aMax));
-                        raw                = vsubq_u8(raw, vandq_u8(isLower, sub32));
+                        // Subtract 32 from valid mask lanes
+                        raw = vsubq_u8(raw, vandq_u8(isLower, sub32));
                     }
 
+                    // Extract minimum evaluation across comparison mask to detect any zeros (mismatches)
                     if (ReduceMin8(vceqq_u8(c1, raw)) != 0xFF)
                     {
                         return false;
                     }
                 }
             }
-            else
+            else if constexpr (sizeof(CharT) == 2)
             {
-#if WCHAR_MAX <= 0xFFFF
+                // Process 8 wide characters per iteration (16-bit encoding)
                 constexpr uint32_t VecStep = 8;
+
+                // Preload constants for branchless ASCII case folding
                 const uint16x8_t   aMin    = vdupq_n_u16('a');
                 const uint16x8_t   aMax    = vdupq_n_u16('z');
                 const uint16x8_t   sub32   = vdupq_n_u16(32);
@@ -1557,8 +1741,10 @@ namespace StringPatternMatchDetail
 
                     if constexpr (!std::same_as<TPolicy, AsciiCaseFoldPolicy<wchar_t>> && TPolicy::isCaseInsensitive)
                     {
+                        // If policy supports Unicode, check if chunk contains non-ASCII characters that require scalar folding
                         if (ReduceMax16(raw) > 127)
                         {
+                            // Fallback to scalar verification for this block
                             for (uint32_t k = 0; k < VecStep; ++k)
                             {
                                 if (upperText1[i + k] != policy(text2[i + k]))
@@ -1574,17 +1760,25 @@ namespace StringPatternMatchDetail
 
                     if constexpr (TPolicy::isCaseInsensitive)
                     {
+                        // Check greater-equal 'a' and less-equal 'z' bounds
                         uint16x8_t isLower = vandq_u16(vcgeq_u16(raw, aMin), vcleq_u16(raw, aMax));
-                        raw                = vsubq_u16(raw, vandq_u16(isLower, sub32));
+                        // Subtract 32 from valid mask lanes
+                        raw = vsubq_u16(raw, vandq_u16(isLower, sub32));
                     }
 
+                    // Extract minimum evaluation across comparison mask to detect any zeros (mismatches)
                     if (ReduceMin16(vceqq_u16(c1, raw)) != 0xFFFF)
                     {
                         return false;
                     }
                 }
-#else
+            }
+            else
+            {
+                // Process 4 wide characters per iteration (32-bit encoding)
                 constexpr uint32_t VecStep = 4;
+
+                // Preload constants for branchless ASCII case folding
                 const uint32x4_t   aMin    = vdupq_n_u32('a');
                 const uint32x4_t   aMax    = vdupq_n_u32('z');
                 const uint32x4_t   sub32   = vdupq_n_u32(32);
@@ -1595,8 +1789,10 @@ namespace StringPatternMatchDetail
 
                     if constexpr (!std::same_as<TPolicy, AsciiCaseFoldPolicy<wchar_t>> && TPolicy::isCaseInsensitive)
                     {
+                        // If policy supports Unicode, check if chunk contains non-ASCII characters that require scalar folding
                         if (ReduceMax32(raw) > 127)
                         {
+                            // Fallback to scalar verification for this block
                             for (uint32_t k = 0; k < VecStep; ++k)
                             {
                                 if (upperText1[i + k] != policy(text2[i + k]))
@@ -1612,19 +1808,21 @@ namespace StringPatternMatchDetail
 
                     if constexpr (TPolicy::isCaseInsensitive)
                     {
+                        // Check greater-equal 'a' and less-equal 'z' bounds
                         uint32x4_t isLower = vandq_u32(vcgeq_u32(raw, aMin), vcleq_u32(raw, aMax));
-                        raw                = vsubq_u32(raw, vandq_u32(isLower, sub32));
+                        // Subtract 32 from valid mask lanes
+                        raw = vsubq_u32(raw, vandq_u32(isLower, sub32));
                     }
 
+                    // Extract minimum evaluation across comparison mask to detect any zeros (mismatches)
                     if (ReduceMin32(vceqq_u32(c1, raw)) != 0xFFFFFFFF)
                     {
                         return false;
                     }
                 }
-#endif
             }
 
-            // Remainder scalar loop
+            // Remainder scalar loop for unaligned block tails
             for (; i < compareLength; i++)
             {
                 if (upperText1[i] != policy(text2[i]))
@@ -2841,6 +3039,17 @@ namespace StringPatternMatchDetail
         const CharT* lastStarString         = nullptr;
         uint32_t     starRemainingMinLength = 0;
 
+        // Compile-time normalization lambda heavily reduces code duplication across evaluation branches
+        auto normalize = [&](CharT c) noexcept -> CharT
+        {
+            if constexpr (IsCaseInsensitive)
+            {
+                return m_policy(c);
+            }
+            
+            return c;
+        };
+
         // Propels the evaluation cursor towards the required sequence without invoking
         // recursive state transitions inside the wildcard state machine loop.
         // Fuses directory scope checking and bounds finding into a single pass.
@@ -2851,6 +3060,7 @@ namespace StringPatternMatchDetail
                 if constexpr (std::is_same_v<CharT, char>)
                 {
                     const void* found = std::memchr(s, target, textEnd - s);
+                    
                     if (found)
                     {
                         s = static_cast<const CharT*>(found);
@@ -2858,11 +3068,13 @@ namespace StringPatternMatchDetail
                     }
 
                     s = textEnd;
+                    
                     return false;
                 }
                 else
                 {
                     const wchar_t* found = std::wmemchr(s, target, textEnd - s);
+                    
                     if (found)
                     {
                         s = static_cast<const CharT*>(found);
@@ -2870,6 +3082,7 @@ namespace StringPatternMatchDetail
                     }
 
                     s = textEnd;
+                    
                     return false;
                 }
             }
@@ -2878,116 +3091,58 @@ namespace StringPatternMatchDetail
                 // Unrolled manual scan handles custom CI policies and path separator constraints
                 while (s + 3 < textEnd)
                 {
-                    if constexpr (IsCaseInsensitive)
+                    if (normalize(s[0]) == target)
                     {
-                        if (m_policy(s[0]) == target)
+                        return true;
+                    }
+                    
+                    if constexpr (LimitWildScope) 
+                    { 
+                        if (IsPathSeparator(s[0])) [[unlikely]] 
                         {
-                            return true;
-                        }
-
-                        if constexpr (LimitWildScope) 
-                        { 
-                            if (IsPathSeparator(s[0])) [[unlikely]] 
-                                return false; 
-                        }
-
-                        if (m_policy(s[1]) == target) 
-                        { 
-                            s += 1; 
-                            return true; 
-                        }
-
-                        if constexpr (LimitWildScope)
-                        {
-                            if (IsPathSeparator(s[1])) [[unlikely]]
-                            {
-                                return false;
-                            }
-                        }
-
-                        if (m_policy(s[2]) == target) 
-                        { 
-                            s += 2; 
-                            return true; 
-                        }
-
-                        if constexpr (LimitWildScope) 
-                        { 
-                            if (IsPathSeparator(s[2])) [[unlikely]]
-                            {
-                                return false;
-                            }
-                        }
-
-                        if (m_policy(s[3]) == target) 
-                        { 
-                            s += 3; 
-                            return true; 
-                        }
-
-                        if constexpr (LimitWildScope) 
-                        { 
-                            if (IsPathSeparator(s[3])) [[unlikely]]
-                            {
-                                return false;
-                            }
+                            return false; 
                         }
                     }
-                    else
+
+                    if (normalize(s[1]) == target) 
+                    { 
+                        s += 1; 
+                        return true; 
+                    }
+                    
+                    if constexpr (LimitWildScope)
                     {
-                        if (s[0] == target)
+                        if (IsPathSeparator(s[1])) [[unlikely]]
                         {
-                            return true;
+                            return false;
                         }
+                    }
 
-                        if constexpr (LimitWildScope) 
-                        { 
-                            if (IsPathSeparator(s[0])) [[unlikely]]
-                            {
-                                return false;
-                            }
+                    if (normalize(s[2]) == target) 
+                    { 
+                        s += 2; 
+                        return true; 
+                    }
+                    
+                    if constexpr (LimitWildScope) 
+                    { 
+                        if (IsPathSeparator(s[2])) [[unlikely]]
+                        {
+                            return false;
                         }
+                    }
 
-                        if (s[1] == target) 
-                        { 
-                            s += 1; 
-                            return true; 
-                        }
-
-                        if constexpr (LimitWildScope) 
-                        { 
-                            if (IsPathSeparator(s[1])) [[unlikely]]
-                            {
-                                return false;
-                            }
-                        }
-
-                        if (s[2] == target) 
-                        { 
-                            s += 2; 
-                            return true; 
-                        }
-
-                        if constexpr (LimitWildScope) 
-                        { 
-                            if (IsPathSeparator(s[2])) [[unlikely]]
-                            {
-                                return false;
-                            }
-                        }
-
-                        if (s[3] == target) 
-                        { 
-                            s += 3; 
-                            return true; 
-                        }
-
-                        if constexpr (LimitWildScope) 
-                        { 
-                            if (IsPathSeparator(s[3])) [[unlikely]]
-                            {
-                                return false;
-                            }
+                    if (normalize(s[3]) == target) 
+                    { 
+                        s += 3; 
+                        return true; 
+                    }
+                    
+                    if constexpr (LimitWildScope) 
+                    { 
+                        if (IsPathSeparator(s[3])) [[unlikely]]
+                        {
+                            return false;
                         }
                     }
 
@@ -2997,18 +3152,17 @@ namespace StringPatternMatchDetail
                 // Handle remaining trailing characters
                 while (s < textEnd)
                 {
-                    if constexpr (IsCaseInsensitive)
+                    if (normalize(*s) == target) 
                     {
-                        if (m_policy(*s) == target) return true;
-                    }
-                    else
-                    {
-                        if (*s == target) return true;
+                        return true;
                     }
 
                     if constexpr (LimitWildScope)
                     {
-                        if (IsPathSeparator(*s)) [[unlikely]] return false;
+                        if (IsPathSeparator(*s)) [[unlikely]] 
+                        {
+                            return false;
+                        }
                     }
 
                     s++;
@@ -3028,6 +3182,7 @@ namespace StringPatternMatchDetail
                                 (p[1] == kStar || 
                                  p[1] == kQuestion || 
                                  p[1] == kEscape)) ? p[1] : *p;
+                                 
                 return fastForward(target);
             }
 
@@ -3062,6 +3217,7 @@ namespace StringPatternMatchDetail
                                 {
                                     return false;
                                 }
+                                
                                 s++;
                             }
                         }
@@ -3097,6 +3253,7 @@ namespace StringPatternMatchDetail
 
                     p++;
                     s++;
+                    
                     if (remainingMinLength > 0)
                     {
                         remainingMinLength--;
@@ -3112,33 +3269,17 @@ namespace StringPatternMatchDetail
                     {
                         if (p[1] == kStar || p[1] == kQuestion || p[1] == kEscape) [[likely]]
                         {
-                            if constexpr (IsCaseInsensitive)
+                            if (p[1] == normalize(*s))
                             {
-                                if (p[1] == m_policy(*s))
+                                p += 2;
+                                s++;
+                                
+                                if (remainingMinLength > 0) 
                                 {
-                                    p += 2;
-                                    s++;
-                                    if (remainingMinLength > 0) 
-                                    {
-                                        remainingMinLength--;
-                                    }
-
-                                    continue; // Match success, resume next iteration
+                                    remainingMinLength--;
                                 }
-                            }
-                            else
-                            {
-                                if (p[1] == *s)
-                                {
-                                    p += 2;
-                                    s++;
-                                    if (remainingMinLength > 0) 
-                                    {
-                                        remainingMinLength--;
-                                    }
 
-                                    continue; // Match success, resume next iteration
-                                }
+                                continue; // Match success, resume next iteration
                             }
 
                             break; // Escaped match failure triggers fallback handling below
@@ -3152,33 +3293,17 @@ namespace StringPatternMatchDetail
                 default:
                 {
                     // Standard literal character match evaluation
-                    if constexpr (IsCaseInsensitive)
+                    if (*p == normalize(*s))
                     {
-                        if (*p == m_policy(*s))
+                        p++;
+                        s++;
+                        
+                        if (remainingMinLength > 0) 
                         {
-                            p++;
-                            s++;
-                            if (remainingMinLength > 0) 
-                            {
-                                remainingMinLength--;
-                            }
-
-                            continue; // Match success, resume next iteration
+                            remainingMinLength--;
                         }
-                    }
-                    else
-                    {
-                        if (*p == *s)
-                        {
-                            p++;
-                            s++;
-                            if (remainingMinLength > 0) 
-                            {
-                                remainingMinLength--;
-                            }
 
-                            continue; // Match success, resume next iteration
-                        }
+                        continue; // Match success, resume next iteration
                     }
 
                     break; // Literal match failure triggers fallback handling below

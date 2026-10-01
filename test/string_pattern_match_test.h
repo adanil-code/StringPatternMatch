@@ -898,6 +898,108 @@ inline bool RunCustomFunctorCorrectnessTest()
 }
 
 // -------------------------------------------------------------------------------------
+// Validates that patterns sharing identical prefixes are resolved in strict FIFO
+// registration order during MatchFirst execution.
+// -------------------------------------------------------------------------------------
+template <SupportedChar CharT, CasePolicy<CharT> TPolicy>
+inline bool RunFifoCollisionOrderTest(TPolicy policy = TPolicy{})
+{
+    if (g_abortTests.load() != 0)
+    {
+        return false;
+    }
+
+    StringPatternMatch<CharT, PatternContext, TPolicy> engine(g_testConfig.optMode, std::move(policy));
+    PatternContext ctx1 = {101};
+    PatternContext ctx2 = {102};
+    PatternContext ctx3 = {103};
+
+    const CharT* p1 = StrLiteral<CharT>::get("service_*_start", L"service_*_start");
+    const CharT* p2 = StrLiteral<CharT>::get("service_*",       L"service_*");
+    const CharT* p3 = StrLiteral<CharT>::get("service_api_*",   L"service_api_*");
+    
+    const CharT* text = StrLiteral<CharT>::get("service_api_start", L"service_api_start");
+
+    if (!engine.AddPattern(p1, WildcardScope::Default, std::move(ctx1)))
+    {
+        return false;
+    }
+    
+    if (!engine.AddPattern(p2, WildcardScope::Default, std::move(ctx2)))
+    {
+        return false;
+    }
+    
+    if (!engine.AddPattern(p3, WildcardScope::Default, std::move(ctx3)))
+    {
+        return false;
+    }
+
+    PatternContext* firstResult = nullptr;
+    
+    if (engine.Search(text, firstResult) && firstResult && firstResult->patternId == 101)
+    {
+        LOG_INFO("[+] PASS: FIFO Pattern Collision Chain Order Preserved\n");
+        return true;
+    }
+
+    LOG_ERR("[!] FAIL: FIFO Pattern Collision Chain Order Violated\n");
+    return false;
+}
+
+// -------------------------------------------------------------------------------------
+// Registers patterns at lengths 2, 4, 7, and 16 to evaluate transitions between
+// small-delta scalar unrolling (delta <= 4) and vectorized hashing (delta > 4).
+// -------------------------------------------------------------------------------------
+template <SupportedChar CharT, CasePolicy<CharT> TPolicy>
+inline bool RunRollingHashDeltaProgressionTest(TPolicy policy = TPolicy{})
+{
+    if (g_abortTests.load() != 0)
+    {
+        return false;
+    }
+
+    StringPatternMatch<CharT, PatternContext, TPolicy> engine(g_testConfig.optMode, std::move(policy));
+    PatternContext c1 = {1};
+    PatternContext c2 = {2};
+    PatternContext c3 = {3};
+    PatternContext c4 = {4};
+
+    if (!engine.AddPattern(StrLiteral<CharT>::get("ab*", L"ab*"), WildcardScope::Default, std::move(c1)))
+    {
+        return false;
+    }
+    
+    if (!engine.AddPattern(StrLiteral<CharT>::get("abcd*", L"abcd*"), WildcardScope::Default, std::move(c2)))
+    {
+        return false;
+    }
+    
+    if (!engine.AddPattern(StrLiteral<CharT>::get("abcdefg*", L"abcdefg*"), WildcardScope::Default, std::move(c3)))
+    {
+        return false;
+    }
+    
+    if (!engine.AddPattern(StrLiteral<CharT>::get("abcdefghijklmnop*", L"abcdefghijklmnop*"), WildcardScope::Default, std::move(c4)))
+    {
+        return false;
+    }
+
+    std::vector<PatternContext*> results;
+    const CharT* text = StrLiteral<CharT>::get("abcdefghijklmnop_extra", L"abcdefghijklmnop_extra");
+    bool matched = engine.Search(text, results);
+
+    if (matched && results.size() == 4)
+    {
+        LOG_INFO("[+] PASS: Rolling Hash Delta Progression (Micro-steps & Vector Transitions)\n");
+        return true;
+    }
+
+    LOG_ERR("[!] FAIL: Rolling Hash Delta Progression (Expected 4 matches, got %zu)\n", results.size());
+    return false;
+}
+
+// -------------------------------------------------------------------------------------
 // OS-Specific Path Separators for Tests
 // -------------------------------------------------------------------------------------
 #if defined(_WIN32)
@@ -986,10 +1088,17 @@ inline bool RunCustomFunctorCorrectnessTest()
         CheckTest((RunSingleCorrectnessTest<CharType, PolicyType>(STR("short"), STR("muchlongerpattern"), 0, false, "Length Bounds Fast-Fail")));                                                     \
         CheckTest((RunSingleCorrectnessTest<CharType, PolicyType>(STR("123456789"), STR("123456789"), 0, true, "SWAR Unaligned Tail Check (Match)")));                                               \
         CheckTest((RunSingleCorrectnessTest<CharType, PolicyType>(STR("123456789"), STR("123456780"), 0, false, "SWAR Unaligned Tail Check (Mismatch)")));                                           \
+        CheckTest((RunSingleCorrectnessTest<CharType, PolicyType>(STR("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_12_suffix"), STR("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_12*"), 0, true, "65-Char Prefix Boundary Match (AVX-512 Tail + 1)"))); \
+        CheckTest((RunSingleCorrectnessTest<CharType, PolicyType>(STR("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_1X_suffix"), STR("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_12*"), 0, false, "65-Char Prefix Boundary Mismatch (Tail Loop Rejection)"))); \
+        CheckTest((RunSingleCorrectnessTest<CharType, PolicyType>(STR("abc"), STR("abc*abc"), 0, false, "Prefix/Tail Overlap: Under-Length Fast-Fail")));                                             \
+        CheckTest((RunSingleCorrectnessTest<CharType, PolicyType>(STR("abcabc"), STR("abc*abc"), 0, true, "Prefix/Tail Overlap: Boundary Minimal Match")));                                           \
+        CheckTest((RunSingleCorrectnessTest<CharType, PolicyType>(STR("abc_middle_abc"), STR("abc*abc"), 0, true, "Prefix/Tail Overlap: Full Match")));                                               \
         CheckTest((RunEmptyEngineTest<CharType, PolicyType>(STR("FastExitCheck"))));                                                                                                                   \
         CheckTest((RunClearLifecycleTest<CharType, PolicyType>(STR("flush.txt"), STR("flush.txt"))));                                                                                                  \
         CheckTest((RunMultiPatternCorrectnessTest<CharType, PolicyType>(STR("*.txt"), STR("file.txt"), STR("file.txt"))));                                                                            \
         CheckTest((RunMatchAllSeveralPatternsTest<CharType, PolicyType>(STR("*.txt"), STR("test.*"), STR("*.log"), STR("te*xt"), STR("test.txt"))));                                                  \
+        CheckTest((RunFifoCollisionOrderTest<CharType, PolicyType>()));                                                                                                                                \
+        CheckTest((RunRollingHashDeltaProgressionTest<CharType, PolicyType>()));                                                                                                                       \
     } while (0)
 
 // -------------------------------------------------------------------------------------

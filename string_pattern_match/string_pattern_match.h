@@ -2375,7 +2375,7 @@ namespace StringPatternMatchDetail
         newEntry.prefixData             = fullView.data();
         newEntry.prefixLength           = prefixLength;
         newEntry.suffixData             = (wildPartLength != 0) ? (fullView.data() + prefixLength) : nullptr;
-        newEntry.suffixLength           = wildPartLength;
+        newEntry.suffixLength           = wildPartLength - tailLen;
         newEntry.tailData               = (tailLen != 0) ? (fullView.data() + tailStart) : nullptr;
         newEntry.tailLength             = tailLen;
         newEntry.id                     = ++m_patternCount;
@@ -2439,11 +2439,6 @@ namespace StringPatternMatchDetail
         // Push to the contiguous arena. Because m_hashMap stores indices rather than pointers,
         // std::vector reallocations will not invalidate the map tracking.
         m_patternArena.push_back(std::move(newEntry));
-
-#if defined(_M_ARM64) || defined(__aarch64__) || defined(_M_ARM) || defined(__arm__)
-        // Ensure newly registered structures are visible across weakly ordered architectures
-        std::atomic_thread_fence(std::memory_order_release);
-#endif
 
         return true;
     }
@@ -2686,6 +2681,7 @@ namespace StringPatternMatchDetail
                                                                                 uint32_t            suffixLength) const noexcept
     {
         const bool isSlashScoped = (pattern.scope == WildcardScope::PathSegment);
+        uint32_t   minWildLen    = pattern.minWildcardMatchLength - pattern.tailLength;
 
         // Compile-time evaluation of case branch removes jump instructions from the backtracking engine
         if constexpr (TPolicy::isCaseInsensitive)
@@ -2696,7 +2692,7 @@ namespace StringPatternMatchDetail
                                                  pattern.suffixLength, 
                                                  suffixText, 
                                                  suffixLength, 
-                                                 pattern.minWildcardMatchLength);
+                                                 minWildLen);
             }
             else
             {
@@ -2704,7 +2700,7 @@ namespace StringPatternMatchDetail
                                                   pattern.suffixLength, 
                                                   suffixText, 
                                                   suffixLength, 
-                                                  pattern.minWildcardMatchLength);
+                                                  minWildLen);
             }
         }
         else
@@ -2715,7 +2711,7 @@ namespace StringPatternMatchDetail
                                                   pattern.suffixLength, 
                                                   suffixText, 
                                                   suffixLength, 
-                                                  pattern.minWildcardMatchLength);
+                                                  minWildLen);
             }
             else
             {
@@ -2723,7 +2719,7 @@ namespace StringPatternMatchDetail
                                                    pattern.suffixLength, 
                                                    suffixText, 
                                                    suffixLength, 
-                                                   pattern.minWildcardMatchLength);
+                                                   minWildLen);
             }
         }
     }
@@ -2809,11 +2805,6 @@ namespace StringPatternMatchDetail
                                                                           uint32_t     textLength,
                                                                           F&&          collector) const noexcept
     {      
-#if defined(_M_ARM64) || defined(__aarch64__) || defined(_M_ARM) || defined(__arm__)
-        // Enforce load visibility on loosely-ordered memory architectures before reading published memory
-        std::atomic_thread_fence(std::memory_order_acquire);
-#endif
-
         // Global minimum match length rejection guard
         if (m_lengthVector.empty() || textLength < m_globalMinMatchLength)
         {
@@ -2988,7 +2979,7 @@ namespace StringPatternMatchDetail
                                 if (MatchesTail(currentPattern, text, textLength))
                                 {
                                     // The remaining text characters must be evaluated against the wildcard suffix
-                                    isMatch = MatchesSuffix(currentPattern, text + matchLength, textLength - matchLength);
+                                    isMatch = MatchesSuffix(currentPattern, text + matchLength, textLength - matchLength - currentPattern.tailLength);
                                 }
                             }
 
@@ -3055,11 +3046,14 @@ namespace StringPatternMatchDetail
         // Fuses directory scope checking and bounds finding into a single pass.
         auto fastForward = [&](CharT target) noexcept -> bool
         {
+            size_t boundsLimit      = remainingMinLength > 0 ? (remainingMinLength - 1) : 0;
+            size_t searchableLength = (textEnd - s) - boundsLimit;
+
             if constexpr (!IsCaseInsensitive && !LimitWildScope)
             {
                 if constexpr (std::is_same_v<CharT, char>)
                 {
-                    const void* found = std::memchr(s, target, textEnd - s);
+                    const void* found = std::memchr(s, target, searchableLength);
                     
                     if (found)
                     {
@@ -3067,13 +3061,13 @@ namespace StringPatternMatchDetail
                         return true;
                     }
 
-                    s = textEnd;
+                    s = textEnd - boundsLimit;
                     
                     return false;
                 }
                 else
                 {
-                    const wchar_t* found = std::wmemchr(s, target, textEnd - s);
+                    const wchar_t* found = std::wmemchr(s, target, searchableLength);
                     
                     if (found)
                     {
@@ -3081,7 +3075,7 @@ namespace StringPatternMatchDetail
                         return true;
                     }
 
-                    s = textEnd;
+                    s = textEnd - boundsLimit;
                     
                     return false;
                 }
@@ -3089,7 +3083,8 @@ namespace StringPatternMatchDetail
             else
             {
                 // Unrolled manual scan handles custom CI policies and path separator constraints
-                while (s + 3 < textEnd)
+                const CharT* searchEnd = textEnd - boundsLimit;
+                while (s + 3 < searchEnd)
                 {
                     if (normalize(s[0]) == target)
                     {
@@ -3098,7 +3093,7 @@ namespace StringPatternMatchDetail
                     
                     if constexpr (LimitWildScope) 
                     { 
-                        if (IsPathSeparator(s[0])) [[unlikely]] 
+                        if (StringPatternMatchDetail::IsPathSeparator(s[0])) [[unlikely]] 
                         {
                             return false; 
                         }
@@ -3112,7 +3107,7 @@ namespace StringPatternMatchDetail
                     
                     if constexpr (LimitWildScope)
                     {
-                        if (IsPathSeparator(s[1])) [[unlikely]]
+                        if (StringPatternMatchDetail::IsPathSeparator(s[1])) [[unlikely]]
                         {
                             return false;
                         }
@@ -3126,7 +3121,7 @@ namespace StringPatternMatchDetail
                     
                     if constexpr (LimitWildScope) 
                     { 
-                        if (IsPathSeparator(s[2])) [[unlikely]]
+                        if (StringPatternMatchDetail::IsPathSeparator(s[2])) [[unlikely]]
                         {
                             return false;
                         }
@@ -3140,7 +3135,7 @@ namespace StringPatternMatchDetail
                     
                     if constexpr (LimitWildScope) 
                     { 
-                        if (IsPathSeparator(s[3])) [[unlikely]]
+                        if (StringPatternMatchDetail::IsPathSeparator(s[3])) [[unlikely]]
                         {
                             return false;
                         }
@@ -3150,7 +3145,7 @@ namespace StringPatternMatchDetail
                 }
 
                 // Handle remaining trailing characters
-                while (s < textEnd)
+                while (s < searchEnd)
                 {
                     if (normalize(*s) == target) 
                     {
@@ -3159,7 +3154,7 @@ namespace StringPatternMatchDetail
 
                     if constexpr (LimitWildScope)
                     {
-                        if (IsPathSeparator(*s)) [[unlikely]] 
+                        if (StringPatternMatchDetail::IsPathSeparator(*s)) [[unlikely]] 
                         {
                             return false;
                         }
@@ -3213,7 +3208,7 @@ namespace StringPatternMatchDetail
                         {
                             while (s < textEnd)
                             {
-                                if (IsPathSeparator(*s)) [[unlikely]]
+                                if (StringPatternMatchDetail::IsPathSeparator(*s)) [[unlikely]]
                                 {
                                     return false;
                                 }
@@ -3245,7 +3240,7 @@ namespace StringPatternMatchDetail
                     // '?' matches exactly one character, unless it hits a protected boundary
                     if constexpr (LimitWildScope)
                     {
-                        if (IsPathSeparator(*s)) [[unlikely]]
+                        if (StringPatternMatchDetail::IsPathSeparator(*s)) [[unlikely]]
                         {
                             break; // Triggers fallback handling below
                         }
@@ -3324,7 +3319,7 @@ namespace StringPatternMatchDetail
                 // Ensure backtracking does not cross a hard directory boundary
                 if constexpr (LimitWildScope)
                 {
-                    if (IsPathSeparator(*lastStarString)) [[unlikely]]
+                    if (StringPatternMatchDetail::IsPathSeparator(*lastStarString)) [[unlikely]]
                     {
                         return false;
                     }
@@ -3333,6 +3328,12 @@ namespace StringPatternMatchDetail
                 p = lastStarPattern;
                 s = lastStarString + 1; // Increment to resume backtracking past previous failure position
                 remainingMinLength = starRemainingMinLength;
+
+                // Protect std::memchr bounds against out-of-bounds pointer advancement
+                if (static_cast<size_t>(textEnd - s) < remainingMinLength)
+                {
+                    return false;
+                }
 
                 // Re-engage the linear fast-forward cursor for subsequent tracking jumps
                 if (!advanceToNextTarget())
@@ -3362,8 +3363,8 @@ namespace StringPatternMatchDetail
 //-----------------------------------------------------------------------------------------------------------------------------------------------------------
 //                                                      Main Class Interface
 //-----------------------------------------------------------------------------------------------------------------------------------------------------------
-template <SupportedChar CharT,
-          typename TContext,
+template <SupportedChar     CharT,
+          typename          TContext,
           CasePolicy<CharT> TPolicy = CaseSensitivePolicy<CharT>>
 class StringPatternMatch : public StringPatternMatchDetail::StringPatternMatchImpl<CharT, TContext, TPolicy>
 {

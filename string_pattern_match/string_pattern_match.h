@@ -864,8 +864,9 @@ namespace StringPatternMatchDetail
         {
             if constexpr (std::is_same_v<CharT, char>)
             {
-                // Extend 8-bit narrow characters to 32-bit integers
-                return _mm_cvtepu8_epi32(_mm_cvtsi32_si128(*reinterpret_cast<const int32_t*>(ptr)));
+                int32_t val;
+                std::memcpy(&val, ptr, sizeof(val));
+                return _mm_cvtepu8_epi32(_mm_cvtsi32_si128(val));
             }
             else if constexpr (sizeof(CharT) == 2)
             {
@@ -1181,6 +1182,7 @@ namespace StringPatternMatchDetail
 
                     if constexpr (TPolicy::isCaseInsensitive)
                     {
+                        // Identify lowercase ASCII boundaries and subtract 32
                         __m256i isLower = _mm256_and_si256(_mm256_cmpgt_epi32(raw, aMin), _mm256_cmpgt_epi32(zMax, raw));
                         raw = _mm256_sub_epi32(raw, _mm256_and_si256(isLower, foldSub));
                     }
@@ -1706,6 +1708,20 @@ namespace StringPatternMatchDetail
 
                 for (; i + VecStep - 1 < compareLength; i += VecStep)
                 {
+                    // Fallback to scalar verification for unsupported dynamic/custom CI policies
+                    if constexpr (!std::same_as<TPolicy, AsciiCaseFoldPolicy<char>> && TPolicy::isCaseInsensitive)
+                    {
+                        for (uint32_t k = 0; k < VecStep; ++k)
+                        {
+                            if (upperText1[i + k] != policy(text2[i + k]))
+                            {
+                                return false;
+                            }
+                        }
+
+                        continue;
+                    }
+
                     // Load 128-bit vector blocks of pattern and target text
                     uint8x16_t c1  = vld1q_u8(reinterpret_cast<const uint8_t*>(upperText1 + i));
                     uint8x16_t raw = vld1q_u8(reinterpret_cast<const uint8_t*>(text2 + i));
@@ -2013,9 +2029,9 @@ namespace StringPatternMatchDetail
             uint32_t      contextIndex;           // Index of user context in m_contextArena
             uint32_t      nextEntryIndex;         // Index of next pattern in collision chain (UINT32_MAX if last)
             uint32_t      id;                     // Monotonically increasing pattern registration ID
-            uint16_t      minWildcardMatchLength; // Minimum required characters to satisfy non-'*' wildcard suffix
+            uint32_t      minWildcardMatchLength; // Minimum required characters to satisfy non-'*' wildcard suffix
             WildcardScope scope;                  // Boundary scoping rule (Default vs PathSegment)
-            uint8_t       padding[5];             // Explicit padding to achieve exact 64-byte L1 cache-line alignment
+            uint8_t       padding[3];             // Explicit padding to achieve exact 64-byte L1 cache-line alignment
         };
 
         struct HashBucket
@@ -2038,6 +2054,12 @@ namespace StringPatternMatchDetail
         // Destroys the engine, freeing all resources intrinsically managed by standard containers.
         // -------------------------------------------------------------------------------------------
         ~StringPatternMatchImpl() noexcept = default;
+
+        // Disable shallow copying to prevent dangling PatternEntry pointers into m_stringArena
+        StringPatternMatchImpl(const StringPatternMatchImpl&)                = delete;
+        StringPatternMatchImpl& operator=(const StringPatternMatchImpl&)     = delete;
+        StringPatternMatchImpl(StringPatternMatchImpl&&) noexcept            = default;
+        StringPatternMatchImpl& operator=(StringPatternMatchImpl&&) noexcept = default;
 
     public:
         // -------------------------------------------------------------------------------------------
@@ -2095,6 +2117,30 @@ namespace StringPatternMatchDetail
         void Clear() noexcept;
 
     private:
+        // -------------------------------------------------------------------------------------------
+        // Inserts a 64-bit hash into the L1 register-blocked existence filter.
+        // Uses Fibonacci hashing to guarantee perfectly uniform block distribution 
+        // across short prefix clusters without stalling the execution pipeline.
+        // -------------------------------------------------------------------------------------------
+        inline void AddToHashFilter(uint64_t hash) noexcept
+        {
+            // Golden ratio prime (2^64 / phi) maps dense integer sequences to maximally scattered high bits
+            uint32_t filterIdx  = static_cast<uint32_t>((hash * 11400714819323198485ULL) >> kHashFilterShift);
+            uint64_t filterMask = (1ULL << (hash & 63)) | (1ULL << ((hash >> 6) & 63));
+            m_hashFilter[filterIdx] |= filterMask;
+        }
+
+        // -------------------------------------------------------------------------------------------
+        // Probes the L1 register-blocked existence filter. Parallel extraction of block 
+        // index and bit masks eliminates ALU dependency chains for zero-overhead evaluation.
+        // -------------------------------------------------------------------------------------------
+        [[nodiscard]] inline bool TestHashFilter(uint64_t hashValue) const noexcept
+        {
+            uint32_t filterIdx  = static_cast<uint32_t>((hashValue * 11400714819323198485ULL) >> kHashFilterShift);
+            uint64_t filterMask = (1ULL << (hashValue & 63)) | (1ULL << ((hashValue >> 6) & 63));
+            return (m_hashFilter[filterIdx] & filterMask) == filterMask;
+        }
+
         // -------------------------------------------------------------------------------------------
         // Generates a 64-bit SWAR signature from the prefix of a given string.
         // Accelerates O(1) early rejection before invoking exact string comparisons.
@@ -2210,15 +2256,16 @@ namespace StringPatternMatchDetail
                            uint32_t     remainingMinLength) const noexcept;
 
     private:
-        static constexpr uint32_t kHashFilterWords = 64; // 4096-bit filter array
+        static constexpr uint32_t kHashFilterWords = 512; // 32768-bit (4 KB) L1-resident register-blocked filter array
+        static constexpr uint32_t kHashFilterShift = 55;  // Fibonacci shift amount to extract 9 bits (64 - log2(512))
 
         uint32_t m_patternCount         = 0;           // Total count of registered patterns in the engine
         uint32_t m_globalMinMatchLength = UINT32_MAX;  // Global minimum string length required across all registered patterns
         uint32_t m_globalMaxMatchLength = 0;           // Maximum literal prefix length observed across all patterns
         bool     m_wildCardPresent      = false;       // True if any registered pattern contains wildcard characters
 
-        uint64_t m_hashFilter[kHashFilterWords] = {0}; // Hash-existence filter to instantly reject map misses
-        uint64_t m_lengthFilter[4]              = {0}; // O(1) bitmask filter for rejecting unregistered prefix lengths < 256
+        alignas(64) uint64_t m_hashFilter[kHashFilterWords] = {0}; // Hash-existence filter to instantly reject map misses
+        uint64_t             m_lengthFilter[4]              = {0}; // O(1) bitmask filter for rejecting unregistered prefix lengths < 256
 
         TPolicy m_policy; // Policy instance encapsulating character casing, normalization, and validation
 
@@ -2286,6 +2333,11 @@ namespace StringPatternMatchDetail
                                                                       WildcardScope wildScope,
                                                                       TContext&&    patternContext)
     {
+        if ((pattern == nullptr && patternLength > 0)) [[unlikely]]
+        {
+            throw std::invalid_argument("Pattern buffer cannot be null with a positive length.");
+        }
+
         std::basic_string_view<CharT> patternView(pattern, patternLength);
 
         // Enforce policy validation; throw if characters are rejected by active policy
@@ -2327,7 +2379,7 @@ namespace StringPatternMatchDetail
 
         // Calculate minimum required match length (non-'*' elements) for the suffix
         uint32_t suffixMinLength = 0;
-        for (size_t i = 0; i < wildPartLength; ++i)
+        for (uint32_t i = 0; i < wildPartLength; ++i)
         {
             CharT c = fullView[prefixLength + i];
             if (c == kEscape && i + 1 < wildPartLength &&
@@ -2380,7 +2432,7 @@ namespace StringPatternMatchDetail
         newEntry.tailLength             = tailLen;
         newEntry.id                     = ++m_patternCount;
         newEntry.contextIndex           = ctxIndex;
-        newEntry.minWildcardMatchLength = static_cast<uint16_t>(suffixMinLength);
+        newEntry.minWildcardMatchLength = suffixMinLength;
         newEntry.scope                  = wildScope;
         newEntry.nextEntryIndex         = UINT32_MAX;
 
@@ -2405,8 +2457,7 @@ namespace StringPatternMatchDetail
         uint64_t hash = m_hashFunction(pattern, prefixLength, 0, m_policy);
 
         // Register hash-existence filter signature to accelerate search map bypass
-        uint32_t filterIdx = (hash >> 6) & (kHashFilterWords - 1);
-        m_hashFilter[filterIdx] |= (1ULL << (hash & 63));
+        AddToHashFilter(hash);
 
         // Keep the length vector sorted for efficient rolling hash progression
         auto lengthIterator = std::lower_bound(m_lengthVector.begin(), m_lengthVector.end(), prefixLength);
@@ -2425,20 +2476,19 @@ namespace StringPatternMatchDetail
             // Append to the existing tail to preserve FIFO evaluation order.
             // This is done before push_back to ensure arena references are valid.
             uint32_t tailIndex = mapIterator->second.tailIndex;
+            
+            // Push first to protect bounds against std::bad_alloc reallocations
+            m_patternArena.push_back(std::move(newEntry));
+            
             m_patternArena[tailIndex].nextEntryIndex = newIndex;
-
-            // Update the bucket's tail tracker
             mapIterator->second.tailIndex = newIndex;
         }
         else
         {
             // First entry for this hash bucket
             m_hashMap[hash] = {newIndex, newIndex};
+            m_patternArena.push_back(std::move(newEntry));
         }
-
-        // Push to the contiguous arena. Because m_hashMap stores indices rather than pointers,
-        // std::vector reallocations will not invalidate the map tracking.
-        m_patternArena.push_back(std::move(newEntry));
 
         return true;
     }
@@ -2744,6 +2794,10 @@ namespace StringPatternMatchDetail
                                                                   TContext*&   patternContext) const noexcept
     {
         patternContext = nullptr;
+        if (text == nullptr && textLength > 0) [[unlikely]]
+        {
+            return false;
+        }
 
         // Define a collector that stops on the first match
         auto collector = [&](const TContext* context) -> bool
@@ -2774,6 +2828,10 @@ namespace StringPatternMatchDetail
                                                                   std::vector<TContext*>& patternContexts) const
     {
         patternContexts.clear();
+        if (text == nullptr && textLength > 0) [[unlikely]]
+        {
+            return false;
+        }
 
         // Define a collector that continues processing after a match
         auto collector = [&](const TContext* context) -> bool
@@ -2834,8 +2892,7 @@ namespace StringPatternMatchDetail
 
             uint64_t hashValue = m_hashFunction(text, textLength, 0, m_policy);
 
-            uint32_t filterIdx = (hashValue >> 6) & (kHashFilterWords - 1);
-            if ((m_hashFilter[filterIdx] & (1ULL << (hashValue & 63))) == 0)
+            if (!TestHashFilter(hashValue))
             {
                 return false;
             }
@@ -2908,8 +2965,7 @@ namespace StringPatternMatchDetail
             textIndex = matchLength;
 
             // Fast-path rejection: Check hash-existence filter before touching hash map memory
-            uint32_t filterIdx = (hashValue >> 6) & (kHashFilterWords - 1);
-            if ((m_hashFilter[filterIdx] & (1ULL << (hashValue & 63))) == 0)
+            if (!TestHashFilter(hashValue))
             {
                 continue;
             }
@@ -3397,6 +3453,12 @@ public:
     }
 
     ~StringPatternMatch() noexcept = default;
+
+    // Disable shallow copying to prevent dangling PatternEntry pointers into m_stringArena
+    StringPatternMatch(const StringPatternMatch&)                = delete;
+    StringPatternMatch& operator=(const StringPatternMatch&)     = delete;
+    StringPatternMatch(StringPatternMatch&&) noexcept            = default;
+    StringPatternMatch& operator=(StringPatternMatch&&) noexcept = default;
 
     // -------------------------------------------------------------------------------------------
     // Pattern Registration Wrapper

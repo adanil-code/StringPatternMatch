@@ -59,7 +59,11 @@ using KAFFINITY = ULONG_PTR;
 #ifndef COMPILER_BARRIER
 #if defined(_MSC_VER)
 #include <intrin.h>
-#define COMPILER_BARRIER() _ReadWriteBarrier()
+#if defined(_M_ARM64) || defined(_M_ARM64EC)
+#define COMPILER_BARRIER() __dmb(_ARM64_BARRIER_ISHLD)
+#else
+#define COMPILER_BARRIER() _ReadBarrier()
+#endif
 #else
 #define COMPILER_BARRIER() std::atomic_signal_fence(std::memory_order_seq_cst)
 #endif

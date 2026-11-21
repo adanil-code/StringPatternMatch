@@ -1,6 +1,6 @@
 # High-Performance String Pattern Match Engine
 
-![Platform: Windows / Linux / macOS (x64 / ARM64)](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS%20(x64%20%7C%20ARM64)-blue)
+![Platform: Windows / Linux / macOS (x64 / x86 / ARMv8 / ARMv7)](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS%20(x64%20%7C%20x86%20%7C%20ARMv8%20%7C%20ARMv7)-blue)
 ![Language: C++20](https://img.shields.io/badge/Language-C%2B%2B20-orange)
 ![Environment: User Mode](https://img.shields.io/badge/Environment-User%20Mode-success)
 
@@ -29,7 +29,7 @@
 
 ## Overview
 
-`StringPatternMatch` is a non-blocking, multi-pattern string matching engine designed for high-throughput string filtering, telemetry ingestion, path routing, and rule evaluation in user-space applications. Evaluating candidate strings one pattern at a time via sequential loops or traditional regular expression engines introduces substantial processing latency as rule sets grow. This engine evaluates incoming target strings against a pool of registered patterns simultaneously using prefix grouping, rolling polynomial hashing, a Dynamic Split-Blocked Filter, and non-recursive state machines.
+`StringPatternMatch` is a non-blocking, multi-pattern string matching engine designed for high-throughput string filtering, telemetry ingestion, path routing, and rule evaluation in user-space applications. Evaluating candidate strings one pattern at a time via sequential loops or traditional regular expression engines introduces substantial processing latency as rule sets grow. This engine evaluates incoming target strings against a pool of registered patterns simultaneously using prefix grouping, rolling polynomial hashing, an L1 register-blocked existence filter, and non-recursive state machines.
 
 To support file system filtering and path routing across platforms, the engine natively implements path segment scoping (`WildcardScope::PathSegment`), which prevents wildcard expansion from crossing operating-system-specific directory separator boundaries (`\` on Windows, `/` on POSIX systems).
 
@@ -38,9 +38,9 @@ To support file system filtering and path routing across platforms, the engine n
 * **SIMD Hardware Acceleration & Dynamic Dispatch:** Dynamically evaluates CPU capabilities at runtime on x86/x64 systems via CPUID and OSXSAVE to dispatch optimal SIMD backends (AVX-512, AVX2, or SSE4.1). It uses native 128-bit NEON instructions on ARM architectures and provides a portable scalar fallback path.
 * **Allocation-Free Matching Path:** Following pattern registration, the engine performs no internal heap allocations during candidate evaluation. (The caller-provided output vector used for multi-match collection may allocate memory as it expands).
 * **Lock-Free Read-Copy-Update (RCU) Concurrency:** The engine intentionally avoids internal read/write locks to preserve multi-GB/s SIMD cache throughput. Concurrent updates are achieved via atomic pointer swaps (RCU), ensuring zero contention on the read path.
-* **Dynamic Split-Blocked Filter:** Implements an L1-resident, register-blocked existence filter array (`m_hashFilter`) using Fibonacci hashing to instantly reject non-matching candidate prefix hashes before accessing hash map memory buckets.
-* **64-Bit SWAR Literal Signatures:** Extracts 64-bit SIMD Within A Register (SWAR) prefix signatures and tail anchors for rapid mismatch rejection. Pure ASCII blocks under case-insensitive policies are folded in parallel using bitwise SWAR arithmetic.
-* **Non-Recursive State Machine:** Wildcard evaluation relies on an iterative, non-recursive state machine with bounds-checked fast-forward linear scanning, eliminating recursive stack growth and avoiding stack exhaustion on complex or pathological inputs.
+* **L1 Register-Blocked Existence Filter:** Implements a fixed 4 KB (`uint64_t[512]`, 32,768-bit) L1-resident existence filter array (`m_hashFilter`) using Fibonacci hashing to instantly reject non-matching candidate prefix hashes before accessing hash map memory buckets.
+* **64-Bit SWAR Prefix Signatures & Anchored Tail Filtering:** Extracts 64-bit SIMD Within A Register (SWAR) prefix signatures for $O(1)$ mismatch rejection, paired with anchored trailing literal checks. Pure ASCII blocks under built-in ASCII and Unicode case-folding policies are folded in parallel using bitwise SWAR arithmetic.
+* **Non-Recursive State Machine:** Wildcard evaluation relies on an iterative, non-recursive state machine with bounds-checked fast-forward linear scanning (`std::memchr`/`std::wmemchr`, 64-bit SWAR scanning, and unrolled scalar fallback), eliminating recursive stack growth and avoiding stack exhaustion on complex or pathological inputs.
 * **Policy-Based Normalization:** Decouples casing and validation logic through C++20 concepts, supporting case-sensitive binary matching, 7-bit ASCII case-folding, wide Unicode case-folding, and user-supplied transformation functors.
 * **Dual API Interfaces:** Exposes dual interfaces across all registration and query routines, accepting either modern `std::basic_string_view` instances or raw pointer and character-length pairs.
 
@@ -52,37 +52,40 @@ This engine is the user-mode version of the Windows kernel string pattern match 
 
 ### High-Level Design
 The engine uses a two-phase architecture to maximize CPU efficiency during evaluation:
-1. **Registration Phase (`AddPattern`):** When a pattern is added, the engine parses it into an exact literal prefix, a wildcard middle segment, and an optional trailing literal anchor. The pattern is validated against the active case policy and stored in stable deque storage. The trailing literal anchor is trimmed from the wildcard suffix (`suffixLength = wildPartLength - tailLen`) so the wildcard state machine never re-evaluates characters already verified by the tail check. The literal prefix is hashed via the active SIMD or scalar backend, and its hash is stamped into the Dynamic Split-Blocked Filter. Prefix lengths are tracked in a 256-bit bitmask and a sorted unique length vector. A 64-bit SWAR prefix signature, the minimum required match length, and tail metadata are calculated and stored in a contiguous pattern entry arena. Hash collisions are indexed using intrusive FIFO bucket chains.
-2. **Search Phase (`Search`):** Target text is validated against the global minimum registered length. 
-   * *Exact-Match Fast Path:* If no wildcards are registered across the entire engine, it executes a direct exact-string check using the prefix length bitmask, a single full-text hash computation, and the Dynamic Split-Blocked Filter, bypassing iterative length loops.
-   * *Wildcard Evaluation Path:* If wildcards are present, the engine advances through registered prefix lengths using an incremental rolling polynomial hash. It probes the Dynamic Split-Blocked Filter first. On a filter hit, it accesses the hash table bucket, validates the 64-bit SWAR signature and precomputed minimum length, checks the anchored literal tail, and verifies the prefix. If the prefix and tail pass, the remaining interior text slice (`textLength - matchLength - tailLength`) is evaluated by the non-recursive wildcard state machine.
+1. **Registration Phase (`AddPattern`):** When a pattern is added, the engine validates it against the active case policy, pre-normalizes its characters in-place if case-insensitive, and stores it in stable deque storage. It partitions the pattern into an exact literal prefix, a wildcard middle segment, and an optional trailing literal anchor. The trailing literal anchor is trimmed from the wildcard suffix (`suffixLength = wildPartLength - tailLen`) so the wildcard state machine never re-evaluates characters already verified by the tail check. The literal prefix is hashed via the active SIMD or scalar backend, and its hash is stamped into the L1 register-blocked existence filter. Prefix lengths are tracked in a 256-bit bitmask (for lengths `< 256`) and a sorted unique length vector. A 64-bit SWAR prefix signature, the minimum required match length, and tail metadata are calculated and stored in a contiguous pattern entry arena. Hash collisions are indexed using intrusive FIFO bucket chains.
+2. **Search Phase (`Search`):** Target text is validated against the global minimum registered length.
+   * *Exact-Match Fast Path:* If no wildcards are registered across the entire engine (`!m_wildCardPresent`), it verifies `textLength <= m_globalMaxMatchLength`, checks length membership via the 256-bit length bitmask for `textLength < 256` (or `std::binary_search` on `m_lengthVector` for `textLength >= 256`), computes a single full-text hash, probes the L1 register-blocked existence filter, and validates bucket candidates using the 64-bit SWAR prefix signature and `MatchesPrefix`.
+   * *Wildcard Evaluation Path:* If wildcards are present, the engine advances through registered prefix lengths using an incremental rolling polynomial hash (using inlined scalar micro-steps for deltas $\le 4$ and the dispatched SIMD/scalar backend for larger deltas). It probes the L1 register-blocked existence filter first. On a filter hit, it accesses the hash table bucket and checks candidates in FIFO order: validating the prefix length and remaining minimum length guard, comparing the length-masked 64-bit SWAR signature, and verifying the full literal prefix (`MatchesPrefix`). Once the prefix passes and trailing text remains, it checks the anchored literal tail (`MatchesTail`) and evaluates the remaining interior text slice (`textLength - matchLength - tailLength`) via the non-recursive wildcard state machine.
 
 ### 1. Container Architecture & Memory Organization
 While the kernel implementation uses custom containers (`KStringArena`, `KFlatHashMap`, `KDeque`, `KVector`) to operate without standard runtime support, the user-mode engine utilizes standard C++20 containers structured for cache locality and pointer stability:
-* **`std::deque<StringType>` (`m_stringArena`):** Stores registered pattern characters in stable memory slabs, ensuring that `std::basic_string_view` references to literal prefixes and suffixes remain valid without reallocating existing strings during insertions.
+* **`std::deque<StringType>` (`m_stringArena`):** Stores registered pattern characters in stable memory slabs, ensuring that raw `const CharT*` pointers (`prefixData`, `suffixData`, `tailData`) stored inside `PatternEntry` records remain valid without reallocating existing strings during insertions.
 * **`std::deque<TContext>` (`m_contextArena`):** Maintains stable storage for caller-supplied payload objects.
-* **`std::vector<PatternEntry>` (`m_patternArena`):** Stores 64-byte, cache-aligned metadata records contiguously. Each record packs the 64-bit SWAR signature, prefix/suffix/tail lengths and pointers, collision chain indices, and minimum required lengths into an aligned structure.
+* **`std::vector<PatternEntry>` (`m_patternArena`):** Stores 64-byte, cache-aligned metadata records contiguously. Each record packs the 64-bit SWAR prefix signature, prefix/suffix/tail pointers and lengths, collision chain indices, and minimum required lengths into an aligned structure.
 * **`std::unordered_map<uint64_t, HashBucket, FastHashKey>` (`m_hashMap`):** Indexes prefix hashes to bucket head and tail indices. The `FastHashKey` functor passes the already-mixed 64-bit polynomial hash directly through as the lookup key to avoid redundant secondary hashing.
 
-### 2. SIMD-Accelerated Rolling Polynomial Hash & Dynamic Split-Blocked Filter
-Unlike kernel environments where executing vector instructions requires saving and restoring extended processor register state (`KeSaveExtendedProcessorState` / `KeRestoreExtendedProcessorState`), user-mode execution can utilize SIMD registers directly without OS save penalties. 
+### 2. SIMD-Accelerated Rolling Polynomial Hash & L1 Register-Blocked Existence Filter
+Unlike kernel environments where executing vector instructions requires saving and restoring extended processor register state (`KeSaveExtendedProcessorState` / `KeRestoreExtendedProcessorState`), user-mode execution can utilize SIMD registers directly without OS save penalties.
 
 The engine implements a vectorized polynomial rolling hash using a base multiplier of 131:
-* **Runtime Dispatch:** During construction, the engine queries CPUID and OSXSAVE feature flags (`_xgetbv`) on x86/x64 to detect AVX-512 (F and BW), AVX2, or SSE4.1 support. On ARM, it targets native 128-bit NEON instructions. An internal dispatch table resolves hash and prefix comparison function pointers without branch overhead in the search loop.
-* **Vector Processing:** SIMD backends evaluate 4 (SSE4.1, NEON), 8 (AVX2), or 16 (AVX-512) code units per loop iteration using precomputed polynomial weight vectors.
-* **Dynamic Split-Blocked Filter (`m_hashFilter`):** A 512-word (`uint64_t[512]`, 32,768-bit / 4 KB) L1-resident, register-blocked cache filter serves as a high-speed rejection mechanism. It uses Fibonacci hashing via golden ratio multiplication (`hash * 11400714819323198485ULL >> 55`) to distribute entries across 512 independent 64-bit blocks. Within the target 64-bit block, it tests two independent bit positions in parallel (`(1ULL << (hash & 63)) | (1ULL << ((hash >> 6) & 63))`), completely eliminating ALU dependency chains and rejecting map misses prior to accessing main hash map memory.
+* **Runtime Dispatch:** During construction, the engine queries CPUID and OSXSAVE feature flags (`_xgetbv` on Windows, inline `xgetbv` on Linux/macOS) on x86/x64 to detect AVX-512 (F and BW), AVX2, or SSE4.1 support. On ARM/ARM64, it targets native 128-bit NEON instructions. An internal dispatch table resolves hash and prefix comparison function pointers without branch overhead in the search loop.
+* **Vector Processing:** SIMD hashing backends evaluate 4 (SSE4.1, NEON), 8 (AVX2), or 16 (AVX-512) code units per vector register using precomputed polynomial weight vectors (unrolled 2x for AVX-512 and 4x for AVX2, SSE4.1, and NEON). Vectorized case-insensitive prefix comparisons process up to 16 (NEON), 32 (AVX2), or 64 (AVX-512) narrow characters per iteration.
+* **L1 Register-Blocked Existence Filter (`m_hashFilter`):** A fixed 512-word (`alignas(64) uint64_t[512]`, 32,768-bit / 4 KB) L1-resident existence filter serves as a high-speed rejection mechanism. It uses Fibonacci hashing via golden ratio multiplication (`hash * 11400714819323198485ULL >> 55`) to distribute entries across 512 independent 64-bit blocks. Within the target 64-bit block, it tests two independent bit positions in parallel (`(1ULL << (hash & 63)) | (1ULL << ((hash >> 6) & 63))`), completely eliminating ALU dependency chains and rejecting map misses prior to accessing main hash map memory.
 
 ### 3. 64-Bit SWAR Signatures & Anchored Tail Filtering
 To minimize full string comparison overhead on hash collisions, the engine uses multi-character word comparisons:
-* **SWAR Prefix Signatures:** Loads the initial code units of each pattern and candidate text into 64-bit integers. When using ASCII case-folding, it performs a SWAR ASCII check (`IsAsciiSWAR`) and applies parallel bitwise folding (`ToUpperSWAR`) directly within general-purpose registers. Length masking (`MaskSignature`) ensures short prefixes are compared safely without reading out of bounds.
-* **Anchored Tail Verification & Suffix Trimming:** Unescaped literal characters following the final wildcard operator in a pattern are extracted during registration as a tail anchor and trimmed from the wildcard suffix. Before invoking the state machine on a candidate, the engine compares the tail anchor against the end of the input string. Targets lacking the required suffix are rejected in $O(1)$ time, and single-wildcard patterns (`Prefix*Suffix`) under `WildcardScope::Default` resolve in $O(1)$ without scanning the interior text.
+* **SWAR Prefix Signatures:** Loads the initial code units (up to `sizeof(uint64_t) / sizeof(CharT)` characters) of each pattern and candidate text into 64-bit integers. Under `AsciiCaseFoldPolicy<CharT>` and `UnicodeCaseFoldPolicy<wchar_t>`, it performs a SWAR ASCII check (`IsAsciiSWAR`) and applies parallel bitwise folding (`ToUpperSWAR`) directly within general-purpose registers (falling back to per-character policy folding for non-ASCII blocks or `CustomCasePolicy`). Endian-aware length masking (`MaskSignature`) ensures short prefixes are compared safely without reading out of bounds.
+* **Anchored Tail Verification & Suffix Trimming:** Unescaped literal characters following the final wildcard or escape operator in a pattern are extracted during registration as a tail anchor and trimmed from the wildcard suffix. Once a candidate's prefix matches, `MatchesTail` compares the tail anchor against the end of the input string (`std::memcmp` or the dispatched case-insensitive comparator, running in $O(\text{tailLength})$ time) before invoking the state machine. Targets lacking the required suffix are rejected immediately, and single-wildcard patterns (`Prefix*Suffix`) under `WildcardScope::Default` resolve in $O(1)$ without scanning the interior text.
 * **Minimum Length Guards:** Each pattern tracks its minimum possible matching length (literal prefix length plus non-`*` suffix characters). Candidates shorter than this length are discarded immediately.
 
 ### 4. Non-Recursive Fast-Forward Wildcard State Machine
-Traditional wildcard engines often rely on recursive backtracking, risking call-stack exhaustion on complex patterns or large input payloads. 
+Traditional wildcard engines often rely on recursive backtracking, risking call-stack exhaustion on complex patterns or large input payloads.
 
 The engine uses an iterative state machine with bounds-checked fast-forward linear scanning:
-* **Fast-Forward Scanning:** When an asterisk (`*`) is processed, the engine identifies the literal character that immediately follows it, bounds the searchable window by `remainingMinLength`, and uses optimized scan routines to locate candidate positions. In case-sensitive `WildcardScope::Default` contexts, it leverages vector-backed standard library routines (`std::memchr` / `std::wmemchr`). In case-insensitive or segment-limited contexts, it advances through the text using a 4-character unrolled loop.
+* **Fast-Forward Scanning:** When an asterisk (`*`) is processed, the engine identifies the literal character that immediately follows it, bounds the searchable window by `remainingMinLength`, and selects an optimized scan routine to locate candidate positions:
+  * *Case-sensitive `WildcardScope::Default`:* Delegates directly to vector-backed standard library routines (`std::memchr` / `std::wmemchr`).
+  * *Case-sensitive `WildcardScope::PathSegment`, `AsciiCaseFoldPolicy<CharT>`, and `UnicodeCaseFoldPolicy<wchar_t>`:* Executes a 64-bit SWAR fast-forward scanner that inspects 64-bit character blocks in parallel, folding pure ASCII blocks inline via `ToUpperSWAR`, testing target characters and path separators simultaneously, and resolving hit offsets via `std::countr_zero` on little-endian systems (falling back to per-character checks on non-ASCII blocks).
+  * *Custom case-insensitive policies (`CustomCasePolicy`):* Advances through the text using a 4-character unrolled scalar loop.
 * **Bounded Backtracking:** The engine tracks backtracking state using pointer references (`lastStarPattern`, `lastStarString`) and remaining minimum length counters (`starRemainingMinLength`). If a downstream mismatch occurs, the scanner verifies that sufficient characters remain to satisfy `remainingMinLength` and jumps back to the most recent wildcard branch without recursive function calls.
 * **Path Boundary Containment:** When `WildcardScope::PathSegment` is active, the fast-forward scanner halts and rejects matches if an operating-system directory separator is encountered, ensuring wildcard evaluations do not cross folder boundaries.
 
@@ -124,7 +127,9 @@ Callers specify a `WildcardScope` value during pattern registration to control b
 ### Template Parameters
 
 ```cpp
-template <SupportedChar CasePolicy<CharT CharT, TContext, typename> TPolicy = CaseSensitivePolicy<CharT>>
+template <SupportedChar     CharT,
+          typename          TContext,
+          CasePolicy<CharT> TPolicy = CaseSensitivePolicy<CharT>>
 class StringPatternMatch;
 ```
 * **`CharT`**: The character type. Must satisfy the `SupportedChar` concept (`char` or `wchar_t`).
@@ -134,16 +139,16 @@ class StringPatternMatch;
 #### Predefined Case Policies
 * **`CaseSensitivePolicy<CharT>`**: Exact binary equality matching without transformation. Compatible with arbitrary binary data, ASCII, and UTF-8 strings.
 * **`AsciiCaseFoldPolicy<CharT>`**: Maps ASCII characters `a`-`z` to `A`-`Z` via branchless arithmetic while leaving bytes $\ge 128$ unaltered. Rejects non-ASCII patterns during registration via `IsValid()`. **Note on Validation Design:** While registration validation protects the pattern, the engine deliberately omits `IsValid()` checks during the `Search()` phase to avoid injecting an $O(N)$ scanning penalty into the critical hot path. Consumers must independently guarantee that incoming target text is ASCII-compliant. Otherwise, multi-byte UTF-8 sequences in the target text may be sliced or corrupted by byte-level single-character wildcard (`?`) evaluations.
-* **`UnicodeCaseFoldPolicy<wchar_t>`**: Provides wide-character case-folding using `std::towupper` transformations. Fast-paths ASCII segments through SIMD vector registers while falling back to scalar normalization for international wide code points. Constrained to `wchar_t`.
+* **`UnicodeCaseFoldPolicy<wchar_t>`**: Provides wide-character case-folding using `std::towupper` transformations. Fast-paths ASCII segments through SIMD vector registers while falling back to scalar normalization for international wide code points. Constrained to `wchar_t`. **Note on C-Runtime Locale:** `std::towupper` depends on the active `LC_CTYPE` locale (e.g., set via `std::setlocale(LC_CTYPE, "")` prior to registering patterns). In the default `"C"` locale, non-ASCII characters remain unchanged; use `CustomCasePolicy` (see `/unicode_match_sample`) for locale-independent Unicode folding.
 * **`CustomCasePolicy<CharT, TFunctor>`**: Delegates character normalization to a user-supplied functor or mapping table.
 
 #### Optimization Mode Settings
 ```cpp
 enum class OptimizationMode : uint8_t
 {
-    Auto       = 0, // Dynamically detects AVX-512, AVX2, SSE4.1, or NEON at runtime
+    Auto       = 0, // Dynamically detects AVX-512, AVX2, SSE4.1, or NEON at runtime with scalar fallback
     Scalar     = 1, // Enforces portable scalar paths for debugging or testing
-    Vectorized = 2  // Explicitly requires hardware vector acceleration
+    Vectorized = 2  // Queries hardware capabilities and dispatches to the highest supported SIMD backend (with scalar fallback)
 };
 ```
 
@@ -163,6 +168,7 @@ explicit StringPatternMatch(OptimizationMode mode   = OptimizationMode::Auto,
                             TPolicy          policy = TPolicy{}) noexcept;
 ```
 * Initializes the pattern engine with the specified SIMD optimization mode and casing policy. Resolves internal function pointers for hashing and comparisons.
+* **Ownership Semantics:** `StringPatternMatch` is **move-only** (copy construction and copy assignment are deleted to prevent dangling `PatternEntry` pointers into `m_stringArena`).
 
 ```cpp
 void Clear() noexcept;
@@ -185,7 +191,7 @@ bool AddPattern(StringViewType pattern,
 * **`pattern`**: The string view containing the pattern and wildcard syntax.
 * **`wildScope`**: The scoping rule (`WildcardScope::Default` or `WildcardScope::PathSegment`).
 * **`patternContext`**: User payload moved into the engine's internal arena.
-* **Returns**: `true` on success. Throws `std::invalid_argument` if the pattern contains characters rejected by the active `CasePolicy`.
+* **Returns**: `true` on success. Throws `std::invalid_argument` if `pattern` contains characters rejected by the active `CasePolicy`, or if `pattern.size() > UINT32_MAX` on 64-bit platforms. Maintains strong exception safety via internal rollback on allocation failure.
 
 ```cpp
 // Pointer and Length Overload
@@ -199,6 +205,7 @@ bool AddPattern(const CharT*  pattern,
 * **`patternLength`**: Number of characters in the pattern buffer.
 * **`wildScope`**: Scoping behavior for wildcard expansion.
 * **`patternContext`**: User payload moved into the engine's internal arena.
+* **Returns**: `true` on success. Throws `std::invalid_argument` if `pattern == nullptr && patternLength > 0` or if `pattern` is rejected by the active `CasePolicy`.
 
 ---
 
@@ -258,15 +265,15 @@ bool Search(const CharT*            text,
 
 ### Example Implementation
 
-The following example demonstrates instantiating the engine, registering rules with both `std::string_view` and pointer/length parameters, and evaluating target inputs using single-match and multi-match APIs:
+The following cross-platform C++20 example demonstrates instantiating the engine, registering rules using both `std::string_view` and raw pointer/length overloads, verifying OS-native `WildcardScope::PathSegment` boundaries (`\` on Windows, `/` on POSIX), and querying with both single-match and multi-match APIs:
 
 ```cpp
+#include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <string>
 #include <string_view>
 #include <vector>
-#include <cstring>
-#include <cstdint>
 #include "string_pattern_match.h"
 
 // 1. Define a custom context payload associated with registered patterns
@@ -279,41 +286,50 @@ struct SecurityRule
 
 void RunPatternMatchExample()
 {
+    // Use native directory separators so WildcardScope::PathSegment behaves consistently on Windows and POSIX
+#if defined(_WIN32)
+    constexpr std::string_view kAppTmpPattern   = R"(C:\logs\app\*.tmp)";
+    constexpr std::string_view kCriticalPattern = R"(C:\logs\*\critical.log)";
+    constexpr const char*      kAuditRule       = R"(C:\logs\audit\*.log)";
+    constexpr std::string_view kTargetPath      = R"(C:\logs\app\session_88.tmp)";
+    constexpr const char*      kMultiTarget     = R"(C:\logs\audit\critical.log)";
+    constexpr std::string_view kNestedPath      = R"(C:\logs\app\nested\session_88.tmp)";
+#else
+    constexpr std::string_view kAppTmpPattern   = "/var/log/app/*.tmp";
+    constexpr std::string_view kCriticalPattern = "/var/log/*/critical.log";
+    constexpr const char*      kAuditRule       = "/var/log/audit/*.log";
+    constexpr std::string_view kTargetPath      = "/var/log/app/session_88.tmp";
+    constexpr const char*      kMultiTarget     = "/var/log/audit/critical.log";
+    constexpr std::string_view kNestedPath      = "/var/log/app/nested/session_88.tmp";
+#endif
+
     // 2. Initialize the engine
     // Exact binary equality matching engine using automatic SIMD dispatch
     StringPatternMatchA<SecurityRule> matcher(OptimizationMode::Auto);
 
     // 3. Register Patterns using std::string_view
     // Restrict wildcards to the current path segment using WildcardScope::PathSegment
-    matcher.AddPattern(
-        std::string_view("/var/log/app/*.tmp"),
-        WildcardScope::PathSegment,
-        SecurityRule{ 101, "Block temporary files in /var/log/app/", true }
-    );
+    matcher.AddPattern(kAppTmpPattern,
+                       WildcardScope::PathSegment,
+                       SecurityRule{ 101, "Block temporary files in app log directory", true });
 
     // Register a pattern allowing directory traversal via WildcardScope::Default
-    matcher.AddPattern(
-        std::string_view("/var/log/*/critical.log"),
-        WildcardScope::Default,
-        SecurityRule{ 102, "Monitor critical log entries across all log subdirectories", false }
-    );
+    matcher.AddPattern(kCriticalPattern,
+                       WildcardScope::Default,
+                       SecurityRule{ 102, "Monitor critical log entries across all log subdirectories", false });
 
     // 4. Register Patterns using raw pointer and explicit character length
-    const char* auditRule = "/var/log/audit/*.log";
-    uint32_t auditRuleLen = static_cast<uint32_t>(std::strlen(auditRule));
+    const uint32_t auditRuleLen = static_cast<uint32_t>(std::strlen(kAuditRule));
 
-    matcher.AddPattern(
-        auditRule,
-        auditRuleLen,
-        WildcardScope::PathSegment,
-        SecurityRule{ 103, "Audit logs in primary directory", false }
-    );
+    matcher.AddPattern(kAuditRule,
+                       auditRuleLen,
+                       WildcardScope::PathSegment,
+                       SecurityRule{ 103, "Audit logs in primary directory", false });
 
     // 5. Single-Match Search using std::string_view
-    std::string_view targetPath = "/var/log/app/session_88.tmp";
     SecurityRule* matchedRule = nullptr;
 
-    if (matcher.Search(targetPath, matchedRule))
+    if (matcher.Search(kTargetPath, matchedRule))
     {
         std::cout << "Matched Rule ID: " << matchedRule->RuleId << "\n"
                   << "Description:     " << matchedRule->Description << "\n"
@@ -321,11 +337,10 @@ void RunPatternMatchExample()
     }
 
     // 6. Multi-Match Search using raw buffer pointer and length
-    const char* multiMatchTarget = "/var/log/audit/critical.log";
-    uint32_t multiMatchLen = static_cast<uint32_t>(std::strlen(multiMatchTarget));
+    const uint32_t multiMatchLen = static_cast<uint32_t>(std::strlen(kMultiTarget));
 
     std::vector<SecurityRule*> matchedRules;
-    if (matcher.Search(multiMatchTarget, multiMatchLen, matchedRules))
+    if (matcher.Search(kMultiTarget, multiMatchLen, matchedRules))
     {
         std::cout << "Collected " << matchedRules.size() << " matching rule(s):\n";
 
@@ -338,11 +353,10 @@ void RunPatternMatchExample()
     }
 
     // 7. Verify Path Boundary Scoping
-    // This candidate will not match rule 101 because '*' cannot cross directory boundaries
-    std::string_view nestedPath = "/var/log/app/nested/session_88.tmp";
+    // This candidate will not match rule 101 because '*' cannot cross OS path separators
     SecurityRule* nestedMatch = nullptr;
 
-    if (!matcher.Search(nestedPath, nestedMatch))
+    if (!matcher.Search(kNestedPath, nestedMatch))
     {
         std::cout << "Correctly rejected: WildcardScope::PathSegment stopped expansion across path separators.\n";
     }
@@ -371,7 +385,7 @@ The test suite measures physical memory stream ingestion throughput, operation e
 The test harness isolates execution and measures string evaluation performance using the following architectural principles:
 
 * **Correctness-First Execution Gating:** Before performance measurement loops execute, the harness runs a 234-case functional validation suite (117 cases for `wchar_t` and 117 cases for `char`). This covers `UnicodeCaseFoldPolicy`, `CaseSensitivePolicy`, and `AsciiCaseFoldPolicy`, validating directory scoping boundaries, escape tokens, single-character wildcards (`?`), multi-wildcard backtracking, 65-character AVX-512 tail boundaries, prefix/tail overlaps, FIFO collision chain ordering, rolling hash micro-step transitions, empty strings, and engine lifecycle operations. All 234 assertions must pass before benchmark loops commence.
-* **Vectorization & Hardware Selection:** Benchmarks were conducted in vectorized optimization mode (`--opt=vectorized`). On x86/x64 systems, runtime detection queries CPUID and OSXSAVE feature flags (`_xgetbv`) to dispatch AVX-512, AVX2, or SSE4.1 vector lanes. On ARM platforms, 128-bit NEON instructions are dispatched.
+* **Vectorization & Hardware Selection:** Benchmarks were conducted in vectorized optimization mode (`--opt=vectorized`). On x86/x64 systems, runtime detection queries CPUID and OSXSAVE feature flags (`_xgetbv` on Windows, inline `xgetbv` on Linux/macOS) to dispatch AVX-512, AVX2, or SSE4.1 vector lanes. On ARM platforms, 128-bit NEON instructions are dispatched.
 * **Cross-Platform `wchar_t` Memory Layout (2-Byte vs. 4-Byte):** Memory throughput directly tracks the physical byte size of the evaluated character array:
   $$\text{BytesPerOp} = \text{TargetTextLength} \times \text{sizeof(CharT)}$$
   $$\text{Throughput (MB/s)} = \frac{\text{Ops/sec} \times \text{BytesPerOp}}{1{,}048{,}576}$$
@@ -390,72 +404,72 @@ The test harness isolates execution and measures string evaluation performance u
 
 | Workload Profile | Pattern Count | Target Text Length | String Type | Throughput | Operations/sec | Latency/Op |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Realistic File Paths** | 1,000 | 56 Characters | `char` | **1,477 MB/s** | **27.7 Million** | **36 ns** |
-| **Realistic File Paths** | 1,000 | 56 Characters | `wchar_t` | **2,444 MB/s** | **22.9 Million** | **44 ns** |
-| **Negative Realistic File Paths** | 1,000 | 59 Characters | `char` | **1,867 MB/s** | **33.2 Million** | **30 ns** |
-| **Negative Realistic File Paths** | 1,000 | 59 Characters | `wchar_t` | **3,259 MB/s** | **29.0 Million** | **35 ns** |
-| **Exact Match (No Wildcards)** | 100 | 128 Characters | `char` | **2,519 MB/s** | **20.6 Million** | **49 ns** |
-| **Exact Match (No Wildcards)** | 100 | 128 Characters | `wchar_t` | **4,946 MB/s** | **20.3 Million** | **49 ns** |
-| **Negative Exact Literal** | 100 | 128 Characters | `char` | **4,767 MB/s** | **39.1 Million** | **26 ns** |
-| **Negative Exact Literal** | 100 | 128 Characters | `wchar_t` | **8,154 MB/s** | **33.4 Million** | **30 ns** |
-| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `char` | **20 MB/s** | **2,091** | **478.2 µs** |
-| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `wchar_t` | **38 MB/s** | **1,970** | **507.6 µs** |
-| **Heavy Pathological (`*A%dB*`)** | 1,000 | 102,400 Characters | `char` | **1,577 MB/s** | **16.2 K** | **61.9 µs** |
-| **Heavy Pathological (`*A%dB*`)** | 1,000 | 102,400 Characters | `wchar_t` | **2,860 MB/s** | **14.6 K** | **68.3 µs** |
+| **Realistic File Paths** | 1,000 | 56 Characters | `char` | **1,683 MB/s** | **31.5 Million** | **32 ns** |
+| **Realistic File Paths** | 1,000 | 56 Characters | `wchar_t` | **2,553 MB/s** | **23.9 Million** | **42 ns** |
+| **Negative Realistic File Paths** | 1,000 | 59 Characters | `char` | **2,099 MB/s** | **37.3 Million** | **27 ns** |
+| **Negative Realistic File Paths** | 1,000 | 59 Characters | `wchar_t` | **3,456 MB/s** | **30.7 Million** | **33 ns** |
+| **Exact Match (No Wildcards)** | 100 | 128 Characters | `char` | **2,914 MB/s** | **23.9 Million** | **42 ns** |
+| **Exact Match (No Wildcards)** | 100 | 128 Characters | `wchar_t` | **5,142 MB/s** | **21.1 Million** | **47 ns** |
+| **Negative Exact Literal** | 100 | 128 Characters | `char` | **4,883 MB/s** | **40.0 Million** | **25 ns** |
+| **Negative Exact Literal** | 100 | 128 Characters | `wchar_t` | **8,289 MB/s** | **34.0 Million** | **29 ns** |
+| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `char` | **83 MB/s** | **8,530** | **117.2 µs** |
+| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `wchar_t` | **85 MB/s** | **4,367** | **229.0 µs** |
+| **Heavy Pathological (`*A%dB*`)** | 1,000 | 102,400 Characters | `char` | **3,529 MB/s** | **36.1 K** | **27.7 µs** |
+| **Heavy Pathological (`*A%dB*`)** | 1,000 | 102,400 Characters | `wchar_t` | **3,368 MB/s** | **17.2 K** | **58.0 µs** |
 
 #### Bare-Metal Windows 11 (Intel Core i7-1165G7)
 *Environment: Windows 11 26H2, Bare-metal Intel Core i7-1165G7 @ 2.80GHz. MSVC 2026, C++20, Release build.*
 
 | Workload Profile | Pattern Count | Target Text Length | String Type | Throughput | Operations/sec | Latency/Op |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Realistic File Paths** | 1,000 | 56 Characters | `char` | **638 MB/s** | **12.0 Million** | **84 ns** |
-| **Realistic File Paths** | 1,000 | 56 Characters | `wchar_t` | **1,579 MB/s** | **14.8 Million** | **68 ns** |
-| **Negative Realistic File Paths** | 1,000 | 59 Characters | `char` | **969 MB/s** | **17.2 Million** | **58 ns** |
-| **Negative Realistic File Paths** | 1,000 | 59 Characters | `wchar_t` | **1,774 MB/s** | **15.8 Million** | **63 ns** |
-| **Exact Match (No Wildcards)** | 100 | 128 Characters | `char` | **1,590 MB/s** | **13.0 Million** | **77 ns** |
-| **Exact Match (No Wildcards)** | 100 | 128 Characters | `wchar_t` | **3,482 MB/s** | **14.3 Million** | **70 ns** |
-| **Negative Exact Literal** | 100 | 128 Characters | `char` | **4,531 MB/s** | **37.1 Million** | **27 ns** |
-| **Negative Exact Literal** | 100 | 128 Characters | `wchar_t` | **7,433 MB/s** | **30.4 Million** | **33 ns** |
-| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `char` | **19 MB/s** | **1,900** | **526.3 µs** |
-| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `wchar_t` | **35 MB/s** | **1,813** | **551.6 µs** |
-| **Heavy Pathological (`*A%dB*`)** | 1,000 | 102,400 Characters | `char` | **946 MB/s** | **9.7 K** | **103.3 µs** |
-| **Heavy Pathological (`*A%dB*`)** | 1,000 | 102,400 Characters | `wchar_t` | **2,690 MB/s** | **13.8 K** | **72.6 µs** |
+| **Realistic File Paths** | 1,000 | 56 Characters | `char` | **830 MB/s** | **15.5 Million** | **64 ns** |
+| **Realistic File Paths** | 1,000 | 56 Characters | `wchar_t` | **1,586 MB/s** | **14.9 Million** | **67 ns** |
+| **Negative Realistic File Paths** | 1,000 | 59 Characters | `char` | **1,119 MB/s** | **19.9 Million** | **50 ns** |
+| **Negative Realistic File Paths** | 1,000 | 59 Characters | `wchar_t` | **1,910 MB/s** | **17.0 Million** | **59 ns** |
+| **Exact Match (No Wildcards)** | 100 | 128 Characters | `char` | **2,014 MB/s** | **16.5 Million** | **61 ns** |
+| **Exact Match (No Wildcards)** | 100 | 128 Characters | `wchar_t` | **3,699 MB/s** | **15.2 Million** | **66 ns** |
+| **Negative Exact Literal** | 100 | 128 Characters | `char` | **4,864 MB/s** | **39.8 Million** | **25 ns** |
+| **Negative Exact Literal** | 100 | 128 Characters | `wchar_t` | **7,943 MB/s** | **32.5 Million** | **31 ns** |
+| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `char` | **59 MB/s** | **6,046** | **165.4 µs** |
+| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `wchar_t` | **69 MB/s** | **3,545** | **282.1 µs** |
+| **Heavy Pathological (`*A%dB*`)** | 1,000 | 102,400 Characters | `char` | **2,754 MB/s** | **28.2 K** | **35.5 µs** |
+| **Heavy Pathological (`*A%dB*`)** | 1,000 | 102,400 Characters | `wchar_t` | **3,087 MB/s** | **15.8 K** | **63.3 µs** |
 
 #### Bare-Metal Windows 10 (Intel Core i7-8086K)
 *Environment: Windows 10, Bare-metal Intel Core i7-8086K @ 4.00GHz. MSVC 2026, C++20, Release build.*
 
 | Workload Profile | Pattern Count | Target Text Length | String Type | Throughput | Operations/sec | Latency/Op |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Realistic File Paths** | 1,000 | 56 Characters | `char` | **1,090 MB/s** | **20.4 Million** | **49 ns** |
-| **Realistic File Paths** | 1,000 | 56 Characters | `wchar_t` | **1,550 MB/s** | **14.5 Million** | **69 ns** |
-| **Negative Realistic File Paths** | 1,000 | 59 Characters | `char` | **1,209 MB/s** | **21.5 Million** | **47 ns** |
-| **Negative Realistic File Paths** | 1,000 | 59 Characters | `wchar_t` | **2,298 MB/s** | **20.4 Million** | **49 ns** |
-| **Exact Match (No Wildcards)** | 100 | 128 Characters | `char` | **2,060 MB/s** | **16.9 Million** | **59 ns** |
-| **Exact Match (No Wildcards)** | 100 | 128 Characters | `wchar_t` | **3,807 MB/s** | **15.6 Million** | **64 ns** |
-| **Negative Exact Literal** | 100 | 128 Characters | `char` | **3,679 MB/s** | **30.1 Million** | **33 ns** |
-| **Negative Exact Literal** | 100 | 128 Characters | `wchar_t` | **6,107 MB/s** | **25.0 Million** | **40 ns** |
-| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `char` | **17 MB/s** | **1,690** | **591.7 µs** |
-| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `wchar_t` | **30 MB/s** | **1,511** | **661.8 µs** |
-| **Heavy Pathological (`*A%dB*`)** | 1,000 | 102,400 Characters | `char` | **1,186 MB/s** | **12.1 K** | **82.3 µs** |
-| **Heavy Pathological (`*A%dB*`)** | 1,000 | 102,400 Characters | `wchar_t` | **2,143 MB/s** | **11.0 K** | **91.1 µs** |
+| **Realistic File Paths** | 1,000 | 56 Characters | `char` | **1,315 MB/s** | **24.6 Million** | **41 ns** |
+| **Realistic File Paths** | 1,000 | 56 Characters | `wchar_t` | **1,853 MB/s** | **17.4 Million** | **58 ns** |
+| **Negative Realistic File Paths** | 1,000 | 59 Characters | `char` | **1,481 MB/s** | **26.3 Million** | **38 ns** |
+| **Negative Realistic File Paths** | 1,000 | 59 Characters | `wchar_t` | **2,437 MB/s** | **21.7 Million** | **46 ns** |
+| **Exact Match (No Wildcards)** | 100 | 128 Characters | `char` | **2,207 MB/s** | **18.1 Million** | **55 ns** |
+| **Exact Match (No Wildcards)** | 100 | 128 Characters | `wchar_t` | **3,941 MB/s** | **16.1 Million** | **62 ns** |
+| **Negative Exact Literal** | 100 | 128 Characters | `char` | **4,004 MB/s** | **32.8 Million** | **30 ns** |
+| **Negative Exact Literal** | 100 | 128 Characters | `wchar_t` | **6,562 MB/s** | **26.9 Million** | **37 ns** |
+| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `char` | **36 MB/s** | **3,649** | **274.0 µs** |
+| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `wchar_t` | **52 MB/s** | **2,660** | **375.9 µs** |
+| **Heavy Pathological (`*A%dB*`)** | 1,000 | 102,400 Characters | `char` | **2,313 MB/s** | **23.7 K** | **42.2 µs** |
+| **Heavy Pathological (`*A%dB*`)** | 1,000 | 102,400 Characters | `wchar_t` | **2,998 MB/s** | **15.4 K** | **65.1 µs** |
 
 #### Virtualized Linux Guest (VMware on Intel Core i7-8086K)
 *Environment: Linux Fedora 44 and Ubuntu 26.04.1 LTS, GCC 16 (-O3), running inside VMware Workstation hosted on the Windows 10 Intel Core i7-8086K machine.*
 
 | Workload Profile | Pattern Count | Target Text Length | String Type | Throughput | Operations/sec | Latency/Op |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Realistic File Paths** | 1,000 | 56 Characters | `char` | **990 MB/s** | **18.5 Million** | **54 ns** |
-| **Realistic File Paths** | 1,000 | 56 Characters | `wchar_t` | **3,335 MB/s** | **15.6 Million** | **64 ns** |
-| **Negative Realistic File Paths** | 1,000 | 59 Characters | `char` | **1,057 MB/s** | **18.8 Million** | **53 ns** |
-| **Negative Realistic File Paths** | 1,000 | 59 Characters | `wchar_t` | **3,509 MB/s** | **15.6 Million** | **64 ns** |
-| **Exact Match (No Wildcards)** | 100 | 128 Characters | `char` | **1,849 MB/s** | **15.1 Million** | **66 ns** |
-| **Exact Match (No Wildcards)** | 100 | 128 Characters | `wchar_t` | **5,884 MB/s** | **12.1 Million** | **83 ns** |
-| **Negative Exact Literal** | 100 | 128 Characters | `char` | **3,712 MB/s** | **30.4 Million** | **33 ns** |
-| **Negative Exact Literal** | 100 | 128 Characters | `wchar_t` | **11,706 MB/s** | **24.0 Million** | **42 ns** |
-| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `char` | **17 MB/s** | **1,735** | **576.4 µs** |
-| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `wchar_t` | **52 MB/s** | **1,322** | **756.4 µs** |
-| **Heavy Pathological (`*A%dB*`)** | 1,000 | 102,400 Characters | `char` | **1,307 MB/s** | **13.4 K** | **74.7 µs** |
-| **Heavy Pathological (`*A%dB*`)** | 1,000 | 102,400 Characters | `wchar_t` | **3,081 MB/s** | **7.9 K** | **126.8 µs** |
+| **Realistic File Paths** | 1,000 | 56 Characters | `char` | **928 MB/s** | **17.4 Million** | **58 ns** |
+| **Realistic File Paths** | 1,000 | 56 Characters | `wchar_t` | **3,268 MB/s** | **15.3 Million** | **65 ns** |
+| **Negative Realistic File Paths** | 1,000 | 59 Characters | `char` | **983 MB/s** | **17.5 Million** | **57 ns** |
+| **Negative Realistic File Paths** | 1,000 | 59 Characters | `wchar_t` | **3,339 MB/s** | **14.8 Million** | **67 ns** |
+| **Exact Match (No Wildcards)** | 100 | 128 Characters | `char` | **1,821 MB/s** | **14.9 Million** | **67 ns** |
+| **Exact Match (No Wildcards)** | 100 | 128 Characters | `wchar_t` | **5,657 MB/s** | **11.6 Million** | **86 ns** |
+| **Negative Exact Literal** | 100 | 128 Characters | `char` | **3,613 MB/s** | **29.6 Million** | **34 ns** |
+| **Negative Exact Literal** | 100 | 128 Characters | `wchar_t` | **11,642 MB/s** | **23.8 Million** | **42 ns** |
+| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `char` | **60 MB/s** | **6,184** | **161.7 µs** |
+| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `wchar_t` | **56 MB/s** | **1,437** | **695.9 µs** |
+| **Heavy Pathological (`*A%dB*`)** | 1,000 | 102,400 Characters | `char` | **2,847 MB/s** | **29.2 K** | **34.3 µs** |
+| **Heavy Pathological (`*A%dB*`)** | 1,000 | 102,400 Characters | `wchar_t` | **4,857 MB/s** | **12.4 K** | **80.4 µs** |
 
 ---
 
@@ -465,17 +479,17 @@ The test suite was executed under both **GCC 16** and **Clang 22** on the virtua
 
 | Workload Profile | String Type | GCC 16 Throughput | GCC 16 Ops/sec | Clang 22 Throughput | Clang 22 Ops/sec | Throughput Advantage |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Realistic Paths (1k patterns, 56 chars)** | `char` | 990.2 MB/s | 18.54 M | 894.6 MB/s | 16.75 M | GCC +10.7% |
-| **Realistic Paths (1k patterns, 56 chars)** | `wchar_t` | 3,335.3 MB/s | 15.61 M | 3,246.2 MB/s | 15.20 M | GCC +2.7% |
-| **Exact Match (100 patterns, 128 chars)** | `char` | 1,849.4 MB/s | 15.15 M | 1,655.5 MB/s | 13.56 M | GCC +11.7% |
-| **Exact Match (100 patterns, 128 chars)** | `wchar_t` | 5,884.0 MB/s | 12.05 M | 4,802.9 MB/s | 9.84 M | GCC +22.5% |
-| **Exact Negative (100 patterns, 128 chars)**| `char` | 3,711.8 MB/s | 30.41 M | 3,696.6 MB/s | 30.28 M | Comparable (< 1%) |
-| **Exact Negative (100 patterns, 128 chars)**| `wchar_t` | 11,705.9 MB/s | 23.97 M | 7,617.5 MB/s | 15.60 M | GCC +53.7% |
-| **Case-Sensitive Prose (102.4k chars)** | `char` | 1,067.3 MB/s | 10,929 | 1,045.6 MB/s | 10,707 | GCC +2.1% |
-| **Case-Sensitive Prose (102.4k chars)** | `wchar_t` | 714.5 MB/s | 1,829 | 704.7 MB/s | 1,804 | GCC +1.4% |
+| **Realistic Paths (1k patterns, 56 chars)** | `char` | 928.4 MB/s | 17.38 M | 895.5 MB/s | 16.77 M | GCC +3.7% |
+| **Realistic Paths (1k patterns, 56 chars)** | `wchar_t` | 3,268.1 MB/s | 15.30 M | 3,274.5 MB/s | 15.33 M | Comparable (< 1%) |
+| **Exact Match (100 patterns, 128 chars)** | `char` | 1,820.7 MB/s | 14.92 M | 1,733.3 MB/s | 14.20 M | GCC +5.0% |
+| **Exact Match (100 patterns, 128 chars)** | `wchar_t` | 5,657.2 MB/s | 11.59 M | 5,834.2 MB/s | 11.95 M | Clang +3.1% |
+| **Exact Negative (100 patterns, 128 chars)**| `char` | 3,612.9 MB/s | 29.60 M | 3,742.1 MB/s | 30.66 M | Clang +3.6% |
+| **Exact Negative (100 patterns, 128 chars)**| `wchar_t` | 11,642.0 MB/s | 23.84 M | 11,037.8 MB/s | 22.61 M | GCC +5.5% |
+| **Case-Sensitive Prose (102.4k chars)** | `char` | 1,010.3 MB/s | 10,345 | 1,077.9 MB/s | 11,038 | Clang +6.7% |
+| **Case-Sensitive Prose (102.4k chars)** | `wchar_t` | 732.4 MB/s | 1,875 | 738.7 MB/s | 1,891 | Comparable (< 1%) |
 
-* **Algorithmic Parity:** In case-sensitive 100KB prose scanning, GCC and Clang yield closely aligned throughput (~10.7K–10.9K ops/s for `char` and ~1.8K ops/s for `wchar_t`), demonstrating consistent fast-forward and state machine codegen across both toolchains.
-* **Vector Loop Unrolling:** GCC 16 unrolls AVX2 32-bit integer polynomial rolling hash and comparison loops more aggressively for 4-byte `wchar_t` buffers. This delivers a 22.5% higher operation rate in exact literal wide-character matching and a massive 53.7% throughput advantage in wide negative checks.
+* **Close Parity on Short & Wide Workloads:** Both GCC 16 and Clang 22 produce closely matched vector codegen across path filtering and exact-literal benchmarks, staying within 1% on wide realistic paths (~15.3M ops/s) and wide 100KB case-sensitive prose (~1,875–1,891 ops/s). Clang 22 holds a modest **+3.1% to +6.7%** lead on wide exact matches (`5,834.2 MB/s`), narrow exact negative checks (`3,742.1 MB/s`), and narrow case-sensitive prose (`1,077.9 MB/s`).
+* **GCC Edge in Narrow Paths, Wide Negatives & Pathological Wildcards:** GCC 16 leads by **+3.7% to +5.5%** on narrow realistic paths (`928.4 MB/s`), narrow exact literal matches (`1,820.7 MB/s`), and wide exact negative checks (`11,642.0 MB/s`). Across heavy pathological wildcard rules (`*A%dB*`, 1,000 patterns on 102.4k chars), GCC 16 generates tighter loop code, outperforming Clang 22 by **+34.0%** on `char` (`2,846.9 MB/s` vs. `2,124.3 MB/s`) and **+24.8%** on `wchar_t` (`4,857.4 MB/s` vs. `3,891.4 MB/s`).
 
 ---
 
@@ -486,38 +500,38 @@ The test suite was executed under both **GCC 16** and **Clang 22** on the virtua
 <table border="0" cellspacing="0" cellpadding="0">
   <tr>
     <td align="center" valign="middle" width="50%">
-      <img src="assets/um_file_paths_scaling_12700H.png" width="680" alt="Intel Core i7-12700H Scaling Performance">
+      <img src="assets/um_file_paths_scaling_12700H.png" width="800" alt="Intel Core i7-12700H Scaling Performance">
       <br><em>Figure 1: Bare-Metal Windows 11 (Intel Core i7-12700H)</em>
     </td>
     <td align="center" valign="middle" width="50%">
-      <img src="assets/um_file_paths_scaling_vm_fedora.png" width="680" alt="VMware Linux Guest Scaling Performance">
+      <img src="assets/um_file_paths_scaling_vm_fedora.png" width="800" alt="VMware Linux Guest Scaling Performance">
       <br><em>Figure 2: Virtualized Linux Guest (VMware on Intel Core i7-8086K)</em>
     </td>
   </tr>
 </table>
 
-Evaluating realistic paths requires an initial prefix hash lookup, a query against the Dynamic Split-Blocked Filter, an $O(1)$ tail-anchor check, and subsequent evaluation of the remaining interior slice by the non-recursive wildcard state machine. Scaling from 10 to 10,000 registered rules increases pattern metadata footprint. Across bare-metal Windows and virtualized Linux, the engine demonstrates sustained, flat scaling:
-* On bare-metal Windows 11 (i7-12700H, *Figure 1*), `char` throughput holds between **26.89M and 27.80M ops/sec**, while `wchar_t` throughput sustains between **22.18M and 23.46M ops/sec**.
-* On the virtualized Linux guest (VMware on i7-8086K, *Figure 2*), `char` throughput maintains between **18.17M and 18.54M ops/sec** , while `wchar_t` throughput holds between **15.38M and 15.61M ops/sec**.
+Evaluating realistic paths requires an initial prefix hash lookup, a query against the L1 register-blocked existence filter, prefix verification, an anchored tail check, and subsequent evaluation of the remaining interior slice by the non-recursive wildcard state machine. Scaling from 10 to 10,000 registered rules increases pattern metadata footprint. Across bare-metal Windows and virtualized Linux, the engine demonstrates sustained, flat scaling:
+* On bare-metal Windows 11 (i7-12700H, *Figure 1*), `char` throughput holds between **31.02M and 31.52M ops/sec** (31.48M at 10, 31.41M at 100, 31.52M at 1,000, and 31.02M at 10,000 patterns), while `wchar_t` throughput sustains between **23.64M and 24.34M ops/sec** (24.34M at 10, 24.06M at 100, 23.91M at 1,000, and 23.64M at 10,000 patterns).
+* On the virtualized Linux guest (VMware on i7-8086K, *Figure 2*), `char` throughput maintains between **17.38M and 18.10M ops/sec** (18.10M at 10, 17.75M at 100, 17.38M at 1,000, and 17.90M at 10,000 patterns), while `wchar_t` throughput holds between **15.16M and 15.30M ops/sec** (15.28M at 10, 15.30M at 100, 15.30M at 1,000, and 15.16M at 10,000 patterns).
 
 > **Exact String Scaling Performance** — comparison between `char` and `wchar_t` engines evaluating 128-character exact literal patterns across 10, 100, 1,000, and 10,000 pattern sets in MatchFirst mode.
 
 <table border="0" cellspacing="0" cellpadding="0">
   <tr>
     <td align="center" valign="middle" width="50%">
-      <img src="assets/um_exact_string_scaling_12700H.png" width="680" alt="Intel Core i7-12700H Exact String Scaling Performance">
+      <img src="assets/um_exact_string_scaling_12700H.png" width="800" alt="Intel Core i7-12700H Exact String Scaling Performance">
       <br><em>Figure 3: Bare-Metal Windows 11 (Intel Core i7-12700H)</em>
     </td>
     <td align="center" valign="middle" width="50%">
-      <img src="assets/um_exact_string_scaling_vm_fedora.png" width="680" alt="VMware Linux Guest Exact String Performance">
+      <img src="assets/um_exact_string_scaling_vm_fedora.png" width="800" alt="VMware Linux Guest Exact String Performance">
       <br><em>Figure 4: Virtualized Linux Guest (VMware on Intel Core i7-8086K)</em>
     </td>
   </tr>
 </table>
 
-For exact literal matching, the engine maintains flat throughput across all density tiers. When no wildcards are registered, evaluations bypass the state machine entirely, relying on the 256-bit length bitmask, the Dynamic Split-Blocked Filter, and a single $O(1)$ hash map probe. This maintains predictable memory access and cache utilization:
-* On bare-metal Windows 11 (i7-12700H, *Figure 3*), `char` throughput sustains between **20.64M and 21.04M ops/sec** (21.04M at 10, 20.64M at 100, 21.02M at 1,000, and 20.68M at 10,000 patterns), while `wchar_t` throughput holds virtually flat between **20.24M and 20.28M ops/sec** (20.28M at 10, 20.26M at 100, 20.24M at 1,000, and 20.28M at 10,000 patterns).
-* On the virtualized Linux guest (VMware on i7-8086K, *Figure 4*), `char` throughput sustains between **14.87M and 15.27M ops/sec** (15.27M at 10, 15.15M at 100, 14.87M at 1,000, and 15.01M at 10,000 patterns), while `wchar_t` holds between **11.80M and 12.12M ops/sec** (12.12M at 10, 12.05M at 100, 11.80M at 1,000, and 11.83M at 10,000 patterns).
+For exact literal matching, the engine maintains flat throughput across all density tiers. When no wildcards are registered, evaluations bypass the state machine entirely, relying on the 256-bit length bitmask (for lengths `< 256`, or binary search on `m_lengthVector` for $\ge 256$), the L1 register-blocked existence filter, and a single $O(1)$ hash map probe. This maintains predictable memory access and cache utilization:
+* On bare-metal Windows 11 (i7-12700H, *Figure 3*), `char` throughput sustains between **23.87M and 24.25M ops/sec** (24.11M at 10, 23.87M at 100, 24.25M at 1,000, and 24.12M at 10,000 patterns), while `wchar_t` throughput holds virtually flat between **21.06M and 21.22M ops/sec** (21.14M at 10, 21.06M at 100, 21.22M at 1,000, and 21.18M at 10,000 patterns).
+* On the virtualized Linux guest (VMware on i7-8086K, *Figure 4*), `char` throughput sustains between **14.92M and 14.97M ops/sec** (14.97M at 10, 14.92M at 100, 14.96M at 1,000, and 14.95M at 10,000 patterns), while `wchar_t` holds between **11.47M and 11.76M ops/sec** (11.76M at 10, 11.59M at 100, 11.47M at 1,000, and 11.50M at 10,000 patterns).
 
 ---
 
@@ -624,7 +638,7 @@ The `/unicode_match_sample` directory contains a standalone test and benchmark h
 
 Standard single-pattern routines and traditional regular expression libraries can become significant throughput bottlenecks when evaluating high volumes of incoming strings against large rule sets. Sequential evaluation loops introduce latency that scales linearly with pattern count, while recursive backtracking engines risk call-stack exhaustion on complex or pathological inputs.
 
-`StringPatternMatch` addresses these challenges by indexing registered rules simultaneously into prefix groups and applying multi-level filtering. By combining SIMD vector acceleration (AVX-512, AVX2, SSE4.1, and NEON), a Dynamic Split-Blocked Filter, 64-bit SWAR signatures, precalculated length bounds, and an iterative non-recursive wildcard state machine with linear fast-forward scanning, the engine delivers consistent evaluation speeds across varying pattern densities. Whether applied to path routing, high-volume event filtering, or network telemetry, the engine provides sub-microsecond resolution on short targets and sustained throughput across multi-kilobyte payloads. With cross-platform support across Windows, Linux, and macOS on x64 and ARM64 architectures, alongside an allocation-free candidate search path, it provides a performant and reliable string evaluation foundation for modern C++20 applications.
+`StringPatternMatch` addresses these challenges by indexing registered rules simultaneously into prefix groups and applying multi-level filtering. By combining SIMD vector acceleration (AVX-512, AVX2, SSE4.1, and NEON), an L1 register-blocked existence filter, 64-bit SWAR prefix signatures, precalculated length bounds, and an iterative non-recursive wildcard state machine with fast-forward linear scanning, the engine delivers consistent evaluation speeds across varying pattern densities. Whether applied to path routing, high-volume event filtering, or network telemetry, the engine provides sub-microsecond resolution on short targets and sustained throughput across multi-kilobyte payloads. With cross-platform support across Windows, Linux, and macOS on x64 and ARM64 architectures, alongside an allocation-free candidate search path, it provides a performant and reliable string evaluation foundation for modern C++20 applications.
 
 ---
 

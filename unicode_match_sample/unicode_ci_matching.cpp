@@ -243,7 +243,7 @@ void RunBenchmarks(CrossPlatformUnicodeMatcher& matcher,
         { L"Segment Wildcard '?'",    L"Cyrillic",        L"/ДАННЫЕ/ПОЛЬЗОВАТЕЛЬ_5/ОТЧЕТ.DOC",               false },
         { L"Segment Wildcard '?'",    L"Armenian",        L"/ԴԱՆՆԻԵ/Պոլզովատել_3/ՕՏՉԵՏ.DOC",                 false },
         { L"Recursive Wildcard '**'", L"ASCII",           L"/backups/2026/server.tar.gz",                    false },
-        { L"Diacritics & Accents",    L"Latin Extended",  L"/DOCS/ESPAÑOL_FRANÇAIS_ÖSTERREICH/INFORME.TXT",  false },
+        { L"Diacritics & Accents",    L"Latin Extended",  L"/docs/ESPAÑOL_FRANÇAIS_ÖSTERREICH/INFORME.TXT",  false },
         { L"Branchless Identity (0)", L"Hebrew (Uncased)",L"/שלום/תיקייה/data.dat",                          false },
         { L"Branchless Identity (0)", L"Arabic (Uncased)",L"/ملفات/النظام/config.cfg",                       false },
         { L"Locale-Specific I/İ",     L"Turkish",         L"İSTANBUL_İLETİŞİM_SIRRI_2026.TXT",               true  },
@@ -381,7 +381,7 @@ int main()
             L"/Данные/Пользователь_?/отчет.doc",
             WildcardScope::PathSegment,
             EngineRule{ 103, L"Cyrillic", L"Path segment boundary check" },
-            L"/ДАННЫЕ/ПОЛЬЗОВАТЕЛЬ_5/ОТЧЕТ.DOC",
+            L"/ДАННЫЕ/ПОЛЬЗОВАТЕЛЬ_5/отчет.DOC",
             true,
             false
         },
@@ -396,7 +396,7 @@ int main()
         },
         {
             L"Latin Extended Accents",
-            L"/docs/español_français_österreich/*.txt",
+            L"/docs/Español_Français_österreich/*.txt",
             WildcardScope::Default,
             EngineRule{ 105, L"Latin Extended", L"Accented Western European text" },
             L"/DOCS/ESPAÑOL_FRANÇAIS_ÖSTERREICH/INFORME.TXT",
@@ -420,13 +420,22 @@ int main()
             L"/ملفات/النظام/config.cfg",
             true,
             false
+        },        
+        {
+            L"Turkish Dotted/Dotless I (Lower)",
+            L"istanbul_iletişim_sırrı_*.txt",
+            WildcardScope::Default,
+            EngineRule{ 200, L"Turkish", L"Validates lowercase Turkish i in ASCII SWAR prefix" },
+            L"İSTANBUL_İLETİŞİM_SIRRI_2026.TXT",
+            true,
+            true // Routes to matcherTR
         },
         {
             L"Turkish Dotted/Dotless I",
             L"istanbul_iletişim_sırrı_*.txt",
             WildcardScope::Default,
             EngineRule{ 200, L"Turkish", L"Validates dotted i (İ) and dotless ı (I)" },
-            L"İSTANBUL_İLETİŞİM_SIRRI_2026.TXT",
+            L"İstanbul_iletişim_sırrı_2026.TXT",
             true,
             true // Routes to matcherTR
         },

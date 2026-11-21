@@ -876,22 +876,30 @@ inline bool RunCustomFunctorCorrectnessTest()
     using CustomPolicy = CustomCasePolicy<wchar_t, CustomLowercaseFunctor>;
     StringPatternMatch<wchar_t, PatternContext, CustomPolicy> engine(g_testConfig.optMode,
                                                                      CustomPolicy(CustomLowercaseFunctor{}));
-    PatternContext ctx = {999};
+    PatternContext ctxShort = {999};
+    PatternContext ctxLong  = {1000};
 
-    std::wstring patternString = L"HeLlo*";
+    std::wstring shortPattern = L"HeLlo*";
+    std::wstring longPattern  = L"WoRld_1234567890_ABCDEFGHIJKLMNOPQRST*";
 
-    if (!engine.AddPattern(patternString, WildcardScope::Default, std::move(ctx)))
+    if (!engine.AddPattern(shortPattern, WildcardScope::Default, std::move(ctxShort)) ||
+        !engine.AddPattern(longPattern, WildcardScope::Default, std::move(ctxLong)))
     {
         LOG_ERR("[!] FAIL: SIMD Custom Functor Hijack - AddPattern Failed\n");
         return false;
     }
 
-    std::wstring textString = L"hElLo_world";
+    std::wstring shortText = L"hElLo_world";
+    std::wstring longText  = L"wOrLd_1234567890_abcdefghijklmnopqrst_test";
 
-    PatternContext* firstResult = nullptr;
-    bool matchedFirst = engine.Search(textString, firstResult);
+    PatternContext* shortResult = nullptr;
+    PatternContext* longResult  = nullptr;
 
-    if (matchedFirst && firstResult != nullptr && firstResult->patternId == 999)
+    bool matchedShort = engine.Search(shortText, shortResult);
+    bool matchedLong  = engine.Search(longText, longResult);
+
+    if (matchedShort && shortResult != nullptr && shortResult->patternId == 999 &&
+        matchedLong  && longResult  != nullptr && longResult->patternId  == 1000)
     {
         LOG_INFO("[+] PASS: SIMD Custom Functor Hijack (False Negatives)\n");
         return true;
@@ -1127,23 +1135,51 @@ inline void RunCorrectnessForType(uint32_t& passedCount,
         }
     };
 
+    auto RunPolicySuite = [&](const char* policyName, auto&& suiteFunc)
+    {
+        const uint32_t passedBefore = passedCount;
+        const uint32_t failedBefore = failedCount;
+
+        suiteFunc();
+
+        const uint32_t policyPassed = passedCount - passedBefore;
+        const uint32_t policyFailed = failedCount - failedBefore;
+
+        if (policyFailed == 0)
+        {
+            LOG_INFO("[+] PASS: %s (%u passed)\n", policyName, policyPassed);
+        }
+        else
+        {
+            LOG_ERR("[!] FAIL: %s (%u passed, %u failed)\n", policyName, policyPassed, policyFailed);
+        }
+    };
+
     if constexpr (std::is_same_v<CharT, wchar_t>)
     {
-        LOG_INFO("[+] Testing UnicodeCaseFoldPolicy<wchar_t>:\n");
-        EXECUTE_CORRECTNESS_SUITE(wchar_t, UnicodeCaseFoldPolicy<wchar_t>, WIDEN_STRING);
+        RunPolicySuite("UnicodeCaseFoldPolicy<wchar_t>", [&]()
+        {
+            EXECUTE_CORRECTNESS_SUITE(wchar_t, UnicodeCaseFoldPolicy<wchar_t>, WIDEN_STRING);
+        });
 
-        LOG_INFO("[+] Testing CaseSensitivePolicy<wchar_t>:\n");
-        EXECUTE_CORRECTNESS_SUITE(wchar_t, CaseSensitivePolicy<wchar_t>, WIDEN_STRING);
+        RunPolicySuite("CaseSensitivePolicy<wchar_t>", [&]()
+        {
+            EXECUTE_CORRECTNESS_SUITE(wchar_t, CaseSensitivePolicy<wchar_t>, WIDEN_STRING);
+        });
 
         CheckTest(RunCustomFunctorCorrectnessTest());
     }
     else
     {
-        LOG_INFO("[+] Testing CaseSensitivePolicy<char>:\n");
-        EXECUTE_CORRECTNESS_SUITE(char, CaseSensitivePolicy<char>, NARROW_STRING);
+        RunPolicySuite("CaseSensitivePolicy<char>", [&]()
+        {
+            EXECUTE_CORRECTNESS_SUITE(char, CaseSensitivePolicy<char>, NARROW_STRING);
+        });
 
-        LOG_INFO("[+] Testing AsciiCaseFoldPolicy<char>:\n");
-        EXECUTE_CORRECTNESS_SUITE(char, AsciiCaseFoldPolicy<char>, NARROW_STRING);
+        RunPolicySuite("AsciiCaseFoldPolicy<char>", [&]()
+        {
+            EXECUTE_CORRECTNESS_SUITE(char, AsciiCaseFoldPolicy<char>, NARROW_STRING);
+        });
 
         CheckTest(RunAsciiPolicyRejectionTest());
     }

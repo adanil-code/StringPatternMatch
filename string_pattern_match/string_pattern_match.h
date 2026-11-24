@@ -664,6 +664,81 @@ namespace StringPatternMatchDetail
     }
 
     // -------------------------------------------------------------------------------------------
+    // 8-way/4-way unrolled scalar GPR polynomial rolling hash for custom case-insensitive
+    // policies (e.g., CustomCasePolicy) using prime multiplier 131.
+    //
+    // Breaks the serial loop-carried multiply dependency chain (1 multiply per 8 characters)
+    // while keeping all normalized code units in general-purpose registers, eliminating SIMD
+    // stack round-trips (temp[Step]) and store-forwarding stalls.
+    //
+    // Parameters:
+    //   text         - Pointer to the text buffer to be hashed.
+    //   textLength   - The length of the text in characters.
+    //   previousHash - The base hash seed or accumulation value.
+    //   policy       - The casing/normalization policy.
+    //
+    // Return:
+    //   The computed 64-bit hash representing the provided text buffer.
+    // -------------------------------------------------------------------------------------------
+    template <SupportedChar CharT, typename TPolicy>
+    inline uint64_t CalculateHashCI_Unrolled(const CharT* text,
+                                             uint32_t     textLength,
+                                             uint64_t     previousHash,
+                                             TPolicy      policy) noexcept
+    {
+        using UCharT = std::make_unsigned_t<CharT>;
+
+        constexpr uint64_t W1 = 131ULL;
+        constexpr uint64_t W2 = W1 * W1;       // 17,161
+        constexpr uint64_t W3 = W2 * W1;       // 2,248,091
+        constexpr uint64_t M4 = W3 * W1;       // 294,499,921
+        constexpr uint64_t M8 = M4 * M4;
+
+        uint64_t hash = previousHash;
+        uint32_t i    = 0;
+
+        // 8-way unrolled GPR block: overlaps independent policy lookups and multiplications
+        for (; textLength - i >= 8; i += 8)
+        {
+            uint64_t u0 = static_cast<uint64_t>(static_cast<UCharT>(policy(text[i + 0])));
+            uint64_t u1 = static_cast<uint64_t>(static_cast<UCharT>(policy(text[i + 1])));
+            uint64_t u2 = static_cast<uint64_t>(static_cast<UCharT>(policy(text[i + 2])));
+            uint64_t u3 = static_cast<uint64_t>(static_cast<UCharT>(policy(text[i + 3])));
+            uint64_t u4 = static_cast<uint64_t>(static_cast<UCharT>(policy(text[i + 4])));
+            uint64_t u5 = static_cast<uint64_t>(static_cast<UCharT>(policy(text[i + 5])));
+            uint64_t u6 = static_cast<uint64_t>(static_cast<UCharT>(policy(text[i + 6])));
+            uint64_t u7 = static_cast<uint64_t>(static_cast<UCharT>(policy(text[i + 7])));
+
+            uint64_t b0 = ((u0 * W3) + (u1 * W2)) + ((u2 * W1) + u3);
+            uint64_t b1 = ((u4 * W3) + (u5 * W2)) + ((u6 * W1) + u7);
+
+            // Right-grouping ((b0 * M4) + b1) executes in parallel with (hash * M8)
+            hash = (hash * M8) + ((b0 * M4) + b1);
+        }
+
+        // 4-way unrolled remainder block
+        if (textLength - i >= 4)
+        {
+            uint64_t u0 = static_cast<uint64_t>(static_cast<UCharT>(policy(text[i + 0])));
+            uint64_t u1 = static_cast<uint64_t>(static_cast<UCharT>(policy(text[i + 1])));
+            uint64_t u2 = static_cast<uint64_t>(static_cast<UCharT>(policy(text[i + 2])));
+            uint64_t u3 = static_cast<uint64_t>(static_cast<UCharT>(policy(text[i + 3])));
+
+            uint64_t b0 = ((u0 * W3) + (u1 * W2)) + ((u2 * W1) + u3);
+            hash = (hash * M4) + b0;
+            i += 4;
+        }
+
+        // Scalar tail for final 0..3 characters
+        for (; i < textLength; i++)
+        {
+            hash = (hash * W1) + static_cast<uint64_t>(static_cast<UCharT>(policy(text[i])));
+        }
+
+        return hash;
+    }
+
+    // -------------------------------------------------------------------------------------------
     // Standard scalar prefix verification comparing normalized text.
     //
     // Parameters:
@@ -698,11 +773,14 @@ namespace StringPatternMatchDetail
     template <SupportedChar CharT, typename TPolicy> \
     TARGET_ATTR static inline VecT ProcessCasing(const VecT& c, const CharT* text, uint32_t offset, const TPolicy& policy) \
     { \
+        static_assert(std::same_as<TPolicy, AsciiCaseFoldPolicy<CharT>> || \
+                      (std::same_as<CharT, wchar_t> && std::same_as<TPolicy, UnicodeCaseFoldPolicy<wchar_t>>), \
+                      "SIMD ProcessCasing only supports AsciiCaseFoldPolicy and UnicodeCaseFoldPolicy."); \
         if constexpr (std::same_as<TPolicy, AsciiCaseFoldPolicy<CharT>>) \
         { \
             return CaseFold(c); \
         } \
-        else if constexpr (std::same_as<CharT, wchar_t> && std::same_as<TPolicy, UnicodeCaseFoldPolicy<wchar_t>>) \
+        else \
         { \
             if (HasNonAscii(c)) \
             { \
@@ -714,15 +792,6 @@ namespace StringPatternMatchDetail
                 return Load<CharT>(temp); \
             } \
             return CaseFold(c); \
-        } \
-        else \
-        { \
-            CharT temp[Step]; \
-            for (uint32_t j = 0; j < Step; j++) \
-            { \
-                temp[j] = policy(text[offset + j]); \
-            } \
-            return Load<CharT>(temp); \
         } \
     }
 
@@ -1829,6 +1898,8 @@ namespace StringPatternMatchDetail
     // and requested optimization constraints.
     //
     // Dispatch Table Mechanics & Architecture Fallbacks:
+    //   - For custom case-insensitive policies (e.g., CustomCasePolicy): Dispatches directly to
+    //     CalculateHashCI_Unrolled at compile time, avoiding SIMD stack round-trip stalls.
     //   - On x86/x64: Indexes directly into a 4-slot constexpr table matching SimdInstructionSet
     //     [0] = Scalar, [1] = Sse41, [2] = Avx2, [3] = Avx512 via runtime DetectCpuSimd().
     //   - On ARM/ARM64 with NEON: Dispatches directly to TraitsNeon::CalculateHash at compile time.
@@ -1850,20 +1921,29 @@ namespace StringPatternMatchDetail
             return &CalculateHashScalar<CharT, kIsCI, TPolicy>;
         }
 
+        if constexpr (kIsCI &&
+                      !std::same_as<TPolicy, AsciiCaseFoldPolicy<CharT>> &&
+                      !(std::same_as<CharT, wchar_t> && std::same_as<TPolicy, UnicodeCaseFoldPolicy<wchar_t>>))
+        {
+            return &CalculateHashCI_Unrolled<CharT, TPolicy>;
+        }
+        else
+        {
 #if defined(SPM_HAS_X86)
-        static constexpr HashFuncType<CharT, TPolicy> kBackends[] =
-            {
-                &CalculateHashScalar<CharT, kIsCI, TPolicy>,         // Index 0: SimdInstructionSet::Scalar (Baseline portable loop)
-                &TraitsSse41::CalculateHash<CharT, kIsCI, TPolicy>,  // Index 1: SimdInstructionSet::Sse41 (128-bit SSE4.1 pipeline)
-                &TraitsAvx2::CalculateHash<CharT, kIsCI, TPolicy>,   // Index 2: SimdInstructionSet::Avx2 (256-bit AVX2 pipeline)
-                &TraitsAvx512::CalculateHash<CharT, kIsCI, TPolicy>  // Index 3: SimdInstructionSet::Avx512 (512-bit AVX-512 pipeline)
-            };
-        return kBackends[static_cast<size_t>(DetectCpuSimd())];
+            static constexpr HashFuncType<CharT, TPolicy> kBackends[] =
+                {
+                    &CalculateHashScalar<CharT, kIsCI, TPolicy>,         // Index 0: SimdInstructionSet::Scalar (Baseline portable loop)
+                    &TraitsSse41::CalculateHash<CharT, kIsCI, TPolicy>,  // Index 1: SimdInstructionSet::Sse41 (128-bit SSE4.1 pipeline)
+                    &TraitsAvx2::CalculateHash<CharT, kIsCI, TPolicy>,   // Index 2: SimdInstructionSet::Avx2 (256-bit AVX2 pipeline)
+                    &TraitsAvx512::CalculateHash<CharT, kIsCI, TPolicy>  // Index 3: SimdInstructionSet::Avx512 (512-bit AVX-512 pipeline)
+                };
+            return kBackends[static_cast<size_t>(DetectCpuSimd())];
 #elif defined(SPM_HAS_NEON)
-        return &TraitsNeon::CalculateHash<CharT, kIsCI, TPolicy>;
+            return &TraitsNeon::CalculateHash<CharT, kIsCI, TPolicy>;
 #else
-        return &CalculateHashScalar<CharT, kIsCI, TPolicy>;
+            return &CalculateHashScalar<CharT, kIsCI, TPolicy>;
 #endif
+        }
     }
 
     //-------------------------------------------------------------------------------------------

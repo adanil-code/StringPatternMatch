@@ -159,6 +159,22 @@ struct TestCase
     bool          registerPattern  = true;  // Flag to prevent duplicate/conflicting pattern registration
 };
 
+// Normalizes '/' path literals to the native OS separator ('\\' on Windows, '/' on Linux/macOS)
+// so WildcardScope::PathSegment rules match StringPatternMatchDetail::IsPathSeparator
+static std::wstring to_native_path(std::wstring path)
+{
+#ifdef _WIN32
+    for (wchar_t& ch : path)
+    {
+        if (ch == L'/')
+        {
+            ch = L'\\';
+        }
+    }
+#endif
+    return path;
+}
+
 //--------------------------------------------------------------------------------------------------
 // Functional Verification Suite
 //--------------------------------------------------------------------------------------------------
@@ -257,16 +273,16 @@ void RunBenchmarks(CrossPlatformUnicodeMatcher& matcher,
 
     std::vector<BenchmarkTarget> targets = 
     {
-        { L"Exact Match Lookup",      L"Hungarian",       L"SZÁMÍTÁSTECHNIKA ALAPJAI",                       false },
-        { L"Prefix/Suffix Wildcards", L"Greek",           L"/VAR/LOG/ΕΛΛΗΝΙΚΆ_SYSTEM.LOG",                   false },
-        { L"Segment Wildcard '?'",    L"Cyrillic",        L"/ДАННЫЕ/ПОЛЬЗОВАТЕЛЬ_5/ОТЧЕТ.DOC",               false },
-        { L"Segment Wildcard '?'",    L"Armenian",        L"/ԴԱՆՆԻԵ/Պոլզովատել_3/ՕՏՉԵՏ.DOC",                 false },
-        { L"Recursive Wildcard '**'", L"ASCII",           L"/backups/2026/server.tar.gz",                    false },
-        { L"Diacritics & Accents",    L"Latin Extended",  L"/docs/ESPAÑOL_FRANÇAIS_ÖSTERREICH/INFORME.TXT",  false },
-        { L"Branchless Identity (0)", L"Hebrew (Uncased)",L"/שלום/תיקייה/data.dat",                          false },
-        { L"Branchless Identity (0)", L"Arabic (Uncased)",L"/ملفات/النظام/config.cfg",                       false },
-        { L"Locale-Specific I/İ",     L"Turkish",         L"İSTANBUL_İLETİŞİM_SIRRI_2026.TXT",               true  },
-        { L"Negative Early Reject",   L"Cyrillic",        L"/ДОКУМЕНТЫ/ПОЛЬЗОВАТЕЛЬ_5/ВЛОЖЕННАЯ_ПАПКА/ОТЧЕТ",false }
+        { L"Exact Match Lookup",      L"Hungarian",       L"SZÁMÍTÁSTECHNIKA ALAPJAI",                                       false },
+        { L"Prefix/Suffix Wildcards", L"Greek",           to_native_path(L"/VAR/LOG/ΕΛΛΗΝΙΚΆ_SYSTEM.LOG"),                   false },
+        { L"Segment Wildcard '?'",    L"Cyrillic",        to_native_path(L"/ДАННЫЕ/ПОЛЬЗОВАТЕЛЬ_5/ОТЧЕТ.DOC"),               false },
+        { L"Segment Wildcard '?'",    L"Armenian",        to_native_path(L"/ԴԱՆՆԻԵ/Պոլզովատել_3/ՕՏՉԵՏ.DOC"),                 false },
+        { L"Recursive Wildcard '**'", L"ASCII",           to_native_path(L"/backups/2026/server.tar.gz"),                    false },
+        { L"Diacritics & Accents",    L"Latin Extended",  to_native_path(L"/docs/ESPAÑOL_FRANÇAIS_ÖSTERREICH/INFORME.TXT"),  false },
+        { L"Branchless Identity (0)", L"Hebrew (Uncased)",to_native_path(L"/שלום/תיקייה/data.dat"),                          false },
+        { L"Branchless Identity (0)", L"Arabic (Uncased)",to_native_path(L"/ملفات/النظام/config.cfg"),                       false },
+        { L"Locale-Specific I/İ",     L"Turkish",         L"İSTANBUL_İLETİŞİM_SIRRI_2026.TXT",                               true  },
+        { L"Negative Early Reject",   L"Cyrillic",        to_native_path(L"/ДОКУМЕНТЫ/ПОЛЬЗОВАТЕЛЬ_5/ВЛОЖЕННАЯ_ПАПКА/ОТЧЕТ"),false }
     };
 
     std::wcout << L"================================================================================\n";
@@ -407,64 +423,64 @@ int main()
         },
         {
             L"Greek Wildcard Log",
-            L"/*/ελληνικά_*.log",
+            to_native_path(L"/*/ελληνικά_*.log"),
             WildcardScope::Default,
             EngineRule{ 101, L"Greek", L"Localized Greek logs" },
-            L"/VAR/LOG/ΕΛΛΗΝΙΚΆ_SYSTEM.LOG",
+            to_native_path(L"/VAR/LOG/ΕΛΛΗΝΙΚΆ_SYSTEM.LOG"),
             true,
             false
         },
         {
             L"Armenian Path Segment",
-            L"/Դաննիե/Պոլզովատել_?/օտչետ.doc",
+            to_native_path(L"/Դաննիե/Պոլզովատել_?/օտչետ.doc"),
             WildcardScope::PathSegment,
             EngineRule{ 102, L"Armenian", L"Path segment boundary check" },
-            L"/ԴԱՆՆԻԵ/Պոլզովատել_3/ՕՏՉԵՏ.DOC",
+            to_native_path(L"/ԴԱՆՆԻԵ/Պոլզովատել_3/ՕՏՉԵՏ.DOC"),
             true,
             false
         },
         {
             L"Cyrillic Path Segment",
-            L"/Данные/Пользователь_?/отчет.doc",
+            to_native_path(L"/Данные/Пользователь_?/отчет.doc"),
             WildcardScope::PathSegment,
             EngineRule{ 103, L"Cyrillic", L"Path segment boundary check" },
-            L"/ДАННЫЕ/ПОЛЬЗОВАТЕЛЬ_5/отчет.DOC",
+            to_native_path(L"/ДАННЫЕ/ПОЛЬЗОВАТЕЛЬ_5/отчет.DOC"),
             true,
             false
         },
         {
             L"English ASCII Archive",
-            L"**/*.TAR.GZ",
+            to_native_path(L"**/*.TAR.GZ"),
             WildcardScope::Default,
             EngineRule{ 104, L"English/ASCII", L"Archive extension filter" },
-            L"/backups/2026/server.tar.gz",
+            to_native_path(L"/backups/2026/server.tar.gz"),
             true,
             false
         },
         {
             L"Latin Extended Accents",
-            L"/docs/Español_Français_österreich/*.txt",
+            to_native_path(L"/docs/Español_Français_österreich/*.txt"),
             WildcardScope::Default,
             EngineRule{ 105, L"Latin Extended", L"Accented Western European text" },
-            L"/DOCS/ESPAÑOL_FRANÇAIS_ÖSTERREICH/INFORME.TXT",
+            to_native_path(L"/DOCS/ESPAÑOL_FRANÇAIS_ÖSTERREICH/INFORME.TXT"),
             true,
             false
         },
         {
             L"Hebrew (Uncased)",
-            L"/שלום/תיקייה/*.dat",
+            to_native_path(L"/שלום/תיקייה/*.dat"),
             WildcardScope::Default,
             EngineRule{ 106, L"Hebrew", L"Uncased identity mapping validation" },
-            L"/שלום/תיקייה/data.dat",
+            to_native_path(L"/שלום/תיקייה/data.dat"),
             true,
             false
         },
         {
             L"Arabic (Uncased)",
-            L"/ملفات/النظام/*.cfg",
+            to_native_path(L"/ملفات/النظام/*.cfg"),
             WildcardScope::Default,
             EngineRule{ 107, L"Arabic", L"Uncased identity mapping validation" },
-            L"/ملفات/النظام/config.cfg",
+            to_native_path(L"/ملفات/النظام/config.cfg"),
             true,
             false
         },        
@@ -489,10 +505,10 @@ int main()
         },
         {
             L"Negative: Boundary Violation",
-            L"/Данные/Пользователь_?/отчет.doc",
+            to_native_path(L"/Данные/Пользователь_?/отчет.doc"),
             WildcardScope::PathSegment,
             EngineRule{ 103, L"Cyrillic", L"Should fail across subfolders" },
-            L"/ДАННЫЕ/ПОЛЬЗОВАТЕЛЬ_5/ВЛОЖЕННАЯ_ПАПКА/ОТЧЕТ.DOC",
+            to_native_path(L"/ДАННЫЕ/ПОЛЬЗОВАТЕЛЬ_5/ВЛОЖЕННАЯ_ПАПКА/ОТЧЕТ.DOC"),
             false,
             false,
             false  // Evaluates against Test #4's registered pattern without overwriting RuleId 103
